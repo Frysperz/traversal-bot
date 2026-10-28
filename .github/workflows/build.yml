@@ -1,20 +1,28 @@
-name: Build and Test WASM Bot
+name: Self-Play Train, Build and Test
 
 on: [push, workflow_dispatch]
 
 jobs:
-  build-and-test:
+  train-and-evaluate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout bot repository
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Self-Play Training Session
+        run: python scripts/train.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Build WASM
+      - name: Build WASM Bot
         run: cargo build --release --target wasm32-unknown-unknown
 
       - name: Checkout Traversal Arena SDK
@@ -28,12 +36,12 @@ jobs:
           cd arena-sdk
           docker build -f arena/Dockerfile -t traversal-arena .
 
-      - name: Run Duel against Reference Bot (Sommet)
+      - name: Duel Against Reference Bot (Sommet)
         run: |
           docker run --rm -v "$PWD":/w traversal-arena duel /w/target/wasm32-unknown-unknown/release/mon_bot.wasm sommet --games 20
 
-      - name: Upload Bot Artifact
+      - name: Upload Trained Bot WASM
         uses: actions/upload-artifact@v4
         with:
-          name: mon_bot_wasm
+          name: mon_bot_entraine_wasm
           path: target/wasm32-unknown-unknown/release/*.wasm
