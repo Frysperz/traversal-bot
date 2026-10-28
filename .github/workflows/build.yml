@@ -1,17 +1,38 @@
-name: Debug Build WASM
+name: Build, Duel and Export WASM
 
 on: [push, workflow_dispatch]
 
 jobs:
-  build:
+  build-and-duel:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust & WASM
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cargo Build Verbose
-        run: cargo build --verbose --release --target wasm32-unknown-unknown
+      - name: Build WASM
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Checkout Arena SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Sylv-Lej/traversal-rust-sdk
+          path: arena-sdk
+
+      - name: Build Arena Docker Image
+        run: |
+          cd arena-sdk
+          docker build -f arena/Dockerfile -t traversal-arena .
+
+      - name: Duel Against Reference Bot (Sommet)
+        run: |
+          docker run --rm -v "$PWD":/w traversal-arena duel /w/target/wasm32-unknown-unknown/release/mon_bot.wasm sommet --games 20
+
+      - name: Upload Bot
+        uses: actions/upload-artifact@v4
+        with:
+          name: mon_bot_wasm
+          path: target/wasm32-unknown-unknown/release/*.wasm
