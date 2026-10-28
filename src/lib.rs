@@ -40,9 +40,9 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
 
     // 2. Encodage des pièces sur le plateau (indices 0..99)
     for p in pieces.iter() {
-        let sq = p.square as usize;
+        let sq = p.sq as usize;
         if sq < 100 {
-            features[sq] = if p.side == state.to_move { 1.0 } else { -1.0 };
+            features[sq] = if p.owner == state.to_move { 1.0 } else { -1.0 };
         }
     }
 
