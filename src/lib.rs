@@ -1,50 +1,59 @@
+mod weights;
+
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, Turn};
+use weights::{B1, B2, HIDDEN_SIZE, INPUT_SIZE, W1, W2};
 
-// Poids optimisés issus de la session d'apprentissage
-const SCORE_EXIT: i32               = 1_000_000;
-const WEIGHT_ATTACK: i32            = 2_340;
-const WEIGHT_DOWNWARD_CHARGE: i32   = 620;
-const WEIGHT_EFFICIENT_MOVE: i32    = 15;
-const WEIGHT_FORWARD_PROGRESS: i32  = 90;
+// Inférence du réseau de neurones en f32 natif
+fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
+    let mut hidden = [0.0f32; HIDDEN_SIZE];
 
-fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
+    // Couche cachée 1 + ReLU
+    for j in 0..HIDDEN_SIZE {
+        let mut sum = B1[j];
+        for i in 0..INPUT_SIZE {
+            sum += features[i] * W1[i][j];
+        }
+        hidden[j] = if sum > 0.0 { sum } else { 0.0 }; // ReLU
+    }
+
+    // Couche de sortie
+    let mut output = B2;
+    for j in 0..HIDDEN_SIZE {
+        output += hidden[j] * W2[j];
+    }
+
+    output
+}
+
+fn extract_features_and_eval(turn: &Turn, move_idx: usize) -> f32 {
     let m = &turn.moves[move_idx];
     let state = &turn.state;
 
-    // 1. Sortie de plateau (priorité absolue à la victoire et aux points)
+    // Condition absolue : sortie du plateau
     if m.kind == MoveKind::Exit {
-        return SCORE_EXIT;
+        return 10_000.0;
     }
 
-    let mut score: i32 = 0;
+    let mut features = [0.0f32; INPUT_SIZE];
 
-    // 2. Attaques et combat
-    if m.kind == MoveKind::Attack {
-        score += WEIGHT_ATTACK;
-        let net_power = (m.attack as i32) - (m.defense as i32);
-        score += net_power * WEIGHT_DOWNWARD_CHARGE;
-    }
-
-    // 3. Avancée vers le camp adverse
+    // Encodage du coup joué dans les inputs
     if m.to != 255 {
-        let target_case = m.to as usize;
-        let target_y = (target_case / 10) as i32;
-
-        // Camp 1 (Rouge) avance vers le bas (y=9), Camp 2 (Bleu) vers le haut (y=0)
-        let forward_progress = if state.to_move == 1 {
-            target_y
-        } else {
-            9 - target_y
-        };
-
-        score += forward_progress * WEIGHT_FORWARD_PROGRESS;
-
-        // Pénalité sur le coût en points de mouvement (dénivelé et détours inutiles)
-        score -= (m.cost as i32) * WEIGHT_EFFICIENT_MOVE;
+        let target_idx = m.to as usize;
+        if target_idx < 100 {
+            let y = (target_idx / 10) as f32;
+            let progress = if state.to_move == 1 { y / 9.0 } else { (9.0 - y) / 9.0 };
+            features[target_idx] = progress;
+        }
     }
 
-    score
+    // Caractéristiques globales
+    features[100] = (m.attack as f32) / 5.0;
+    features[101] = (m.defense as f32) / 5.0;
+    features[102] = (m.cost as f32) / 10.0;
+    features[103] = if m.kind == MoveKind::Attack { 1.0 } else { 0.0 };
+
+    neural_network_eval(&features)
 }
 
 fn choose(turn: &Turn) -> usize {
@@ -53,10 +62,10 @@ fn choose(turn: &Turn) -> usize {
     }
 
     let mut best_idx = 0;
-    let mut best_score = i32::MIN;
+    let mut best_score = f32::NEG_INFINITY;
 
     for i in 0..turn.moves.len() {
-        let score = evaluate_move(turn, i);
+        let score = extract_features_and_eval(turn, i);
         if score > best_score {
             best_score = score;
             best_idx = i;
