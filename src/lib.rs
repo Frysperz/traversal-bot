@@ -1,21 +1,20 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, Turn};
 
-// Constantes calibrées par Self-Play
-const SCORE_SENTINEL_WIN: i32       = 1_000_000;
+// Poids optimisés issus de la session d'apprentissage
+const SCORE_EXIT: i32               = 1_000_000;
 const WEIGHT_ATTACK: i32            = 2_340;
 const WEIGHT_DOWNWARD_CHARGE: i32   = 620;
 const WEIGHT_EFFICIENT_MOVE: i32    = 15;
-const WEIGHT_SENTINEL_ADVANCE: i32  = 145;
-const WEIGHT_VANGUARD_ADVANCE: i32  = 75;
+const WEIGHT_FORWARD_PROGRESS: i32  = 90;
 
 fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
     let m = &turn.moves[move_idx];
     let state = &turn.state;
 
-    // 1. Victoire immédiate
+    // 1. Sortie de plateau (priorité absolue aux points et à la victoire)
     if m.kind == MoveKind::Exit {
-        return SCORE_SENTINEL_WIN;
+        return SCORE_EXIT;
     }
 
     let mut score: i32 = 0;
@@ -27,28 +26,21 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
         score += net_power * WEIGHT_DOWNWARD_CHARGE;
     }
 
-    // 3. Déplacement et poussée de pions
+    // 3. Avancée vers le camp adverse
     if m.target != 255 {
         let target_case = m.target as usize;
         let target_y = (target_case / 10) as i32;
 
+        // Rouge (1) progresse vers le bas (y=9), Bleu (2) vers le haut (y=0)
         let forward_progress = if state.side_to_move == 1 {
             target_y
         } else {
             9 - target_y
         };
 
-        let piece_idx = m.piece as usize;
-        if piece_idx < state.pieces.len() {
-            let piece_kind = state.pieces[piece_idx].kind as u8;
-            match piece_kind {
-                2 => score += forward_progress * WEIGHT_SENTINEL_ADVANCE,
-                1 => score += forward_progress * WEIGHT_VANGUARD_ADVANCE,
-                _ => score += forward_progress * 25,
-            }
-        }
+        score += forward_progress * WEIGHT_FORWARD_PROGRESS;
 
-        // Pénalité sur le coût en déplacement/dénivelé
+        // Pénalité sur le coût en points de mouvement (dénivelé / détours inutiles)
         score -= (m.cost as i32) * WEIGHT_EFFICIENT_MOVE;
     }
 
