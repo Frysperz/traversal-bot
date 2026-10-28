@@ -1,13 +1,14 @@
 mod weights;
 
 use traversal_bot::core::MoveKind;
-use traversal_bot::{bot, Turn};
+use traversal_bot::{bot, fuel_left, Turn};
 use weights::{B1, B2, HIDDEN_SIZE, INPUT_SIZE, W1, W2};
 
-fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
+const SAFETY_FUEL: i64 = 50_000_000; // Large réserve de sécurité sur les 2 milliards
+
+fn neural_eval(features: &[f32; INPUT_SIZE]) -> f32 {
     let mut hidden = [0.0f32; HIDDEN_SIZE];
 
-    // Passe couche cachée + activation ReLU
     for j in 0..HIDDEN_SIZE {
         let mut sum = B1[j];
         for i in 0..INPUT_SIZE {
@@ -16,7 +17,6 @@ fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
         hidden[j] = if sum > 0.0 { sum } else { 0.0 };
     }
 
-    // Couche de sortie
     let mut output = B2;
     for j in 0..HIDDEN_SIZE {
         output += hidden[j] * W2[j];
@@ -29,16 +29,16 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
     let state = &turn.state;
     let pieces = state.pieces();
 
-    // 1. Priorité absolue : sortie du plateau
+    // 1. Sortie du plateau : Priorité Sentinelle
     if m.kind == MoveKind::Exit {
         let p_idx = m.piece as usize;
         let is_sentinel = p_idx < pieces.len() && (pieces[p_idx].kind as u8 == 2);
-        return if is_sentinel { 50_000.0 } else { 10_000.0 };
+        return if is_sentinel { 100_000.0 } else { 15_000.0 };
     }
 
     let mut features = [0.0f32; INPUT_SIZE];
 
-    // 2. Encodage des pièces sur le plateau (indices 0..99)
+    // 2. Grille (0..99)
     for p in pieces.iter() {
         let sq = p.sq as usize;
         if sq < 100 {
@@ -46,17 +46,17 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
         }
     }
 
-    // 3. Encodage du coup testé
+    // 3. Caractéristiques du coup
     let mut target_y = 0.0f32;
     let mut height_val = 0.0f32;
+    let target_sq = m.to as usize;
 
     if m.to != 255 {
-        let sq = m.to as usize;
-        let y = (sq / 10) as f32;
+        let y = (target_sq / 10) as f32;
         target_y = if state.to_move == 1 { y / 9.0 } else { (9.0 - y) / 9.0 };
 
-        if sq < state.heights.len() {
-            height_val = (state.heights[sq] as f32) / 4.0;
+        if target_sq < state.heights.len() {
+            height_val = (state.heights[target_sq] as f32) / 4.0;
         }
     }
 
@@ -77,7 +77,30 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
     features[108] = if piece_kind == 2 { 1.0 } else { 0.0 };
     features[109] = ((m.attack as i32 - m.defense as i32) as f32) / 5.0;
 
-    neural_network_eval(&features)
+    let mut score = neural_eval(&features);
+
+    // 4. Sécurité tactique immédiate : éviter le suicide
+    if m.to != 255 {
+        let tx = (target_sq % 10) as i32;
+        let ty = (target_sq / 10) as i32;
+
+        for enemy in pieces.iter().filter(|p| p.owner != state.to_move) {
+            let ex = (enemy.sq % 10) as i32;
+            let ey = (enemy.sq / 10) as i32;
+            let dist = (tx - ex).abs() + (ty - ey).abs();
+
+            // Si on atterrit au corps-à-corps avec un ennemi plus fort surélevé
+            if dist == 1 {
+                let my_h = state.heights[target_sq] as i32;
+                let en_h = state.heights[enemy.sq as usize] as i32;
+                if en_h > my_h {
+                    score -= 40.0; // Pénalité pour exposition au contre-coup descendant
+                }
+            }
+        }
+    }
+
+    score
 }
 
 fn choose(turn: &Turn) -> usize {
@@ -89,6 +112,10 @@ fn choose(turn: &Turn) -> usize {
     let mut best_score = f32::NEG_INFINITY;
 
     for i in 0..turn.moves.len() {
+        if fuel_left() < SAFETY_FUEL {
+            break;
+        }
+
         let score = evaluate_move(turn, i);
         if score > best_score {
             best_score = score;
