@@ -1,12 +1,13 @@
-name: Build WASM Bot
+name: Build and Test WASM Bot
 
 on: [push, workflow_dispatch]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout bot repository
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -14,9 +15,24 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Build WASM
-        run: cargo build --verbose --release --target wasm32-unknown-unknown
+        run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Upload Bot
+      - name: Checkout Traversal Arena SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Sylv-Lej/traversal-rust-sdk
+          path: arena-sdk
+
+      - name: Build Arena Docker Image
+        run: |
+          cd arena-sdk
+          docker build -f arena/Dockerfile -t traversal-arena .
+
+      - name: Run Duel against Reference Bot (Sommet)
+        run: |
+          docker run --rm -v "$PWD":/w traversal-arena duel /w/target/wasm32-unknown-unknown/release/mon_bot.wasm sommet --games 20
+
+      - name: Upload Bot Artifact
         uses: actions/upload-artifact@v4
         with:
           name: mon_bot_wasm
