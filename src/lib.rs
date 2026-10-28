@@ -4,7 +4,7 @@ use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
 use weights::{B1, B2, HIDDEN_SIZE, INPUT_SIZE, W1, W2};
 
-const SAFETY_FUEL: i64 = 50_000_000; // Large réserve de sécurité sur les 2 milliards
+const SAFETY_FUEL: u64 = 50_000_000; // Type u64 corrigé
 
 fn neural_eval(features: &[f32; INPUT_SIZE]) -> f32 {
     let mut hidden = [0.0f32; HIDDEN_SIZE];
@@ -89,12 +89,11 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
             let ey = (enemy.sq / 10) as i32;
             let dist = (tx - ex).abs() + (ty - ey).abs();
 
-            // Si on atterrit au corps-à-corps avec un ennemi plus fort surélevé
             if dist == 1 {
                 let my_h = state.heights[target_sq] as i32;
                 let en_h = state.heights[enemy.sq as usize] as i32;
                 if en_h > my_h {
-                    score -= 40.0; // Pénalité pour exposition au contre-coup descendant
+                    score -= 40.0;
                 }
             }
         }
