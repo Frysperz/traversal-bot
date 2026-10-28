@@ -7,7 +7,7 @@ use weights::{B1, B2, HIDDEN_SIZE, INPUT_SIZE, W1, W2};
 fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
     let mut hidden = [0.0f32; HIDDEN_SIZE];
 
-    // Passe couche cachée + ReLU
+    // Passe couche cachée + activation ReLU
     for j in 0..HIDDEN_SIZE {
         let mut sum = B1[j];
         for i in 0..INPUT_SIZE {
@@ -16,7 +16,7 @@ fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
         hidden[j] = if sum > 0.0 { sum } else { 0.0 };
     }
 
-    // Sortie
+    // Couche de sortie
     let mut output = B2;
     for j in 0..HIDDEN_SIZE {
         output += hidden[j] * W2[j];
@@ -27,25 +27,26 @@ fn neural_network_eval(features: &[f32; INPUT_SIZE]) -> f32 {
 fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
     let m = &turn.moves[move_idx];
     let state = &turn.state;
+    let pieces = state.pieces();
 
-    // Priorité absolue : sortie du plateau
+    // 1. Priorité absolue : sortie du plateau
     if m.kind == MoveKind::Exit {
         let p_idx = m.piece as usize;
-        let is_sentinel = p_idx < state.pieces.len() && (state.pieces[p_idx].kind as u8 == 2);
+        let is_sentinel = p_idx < pieces.len() && (pieces[p_idx].kind as u8 == 2);
         return if is_sentinel { 50_000.0 } else { 10_000.0 };
     }
 
     let mut features = [0.0f32; INPUT_SIZE];
 
-    // 1. Encodage des pièces sur le plateau (0..99)
-    for p in state.pieces.iter() {
+    // 2. Encodage des pièces sur le plateau (indices 0..99)
+    for p in pieces.iter() {
         let sq = p.square as usize;
         if sq < 100 {
             features[sq] = if p.side == state.to_move { 1.0 } else { -1.0 };
         }
     }
 
-    // 2. Encodage du coup testé
+    // 3. Encodage du coup testé
     let mut target_y = 0.0f32;
     let mut height_val = 0.0f32;
 
@@ -59,8 +60,8 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> f32 {
         }
     }
 
-    let piece_kind = if (m.piece as usize) < state.pieces.len() {
-        state.pieces[m.piece as usize].kind as u8
+    let piece_kind = if (m.piece as usize) < pieces.len() {
+        pieces[m.piece as usize].kind as u8
     } else {
         0
     };
