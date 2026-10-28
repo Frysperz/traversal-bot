@@ -12,7 +12,7 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
     let m = &turn.moves[move_idx];
     let state = &turn.state;
 
-    // 1. Sortie de plateau (priorité absolue aux points et à la victoire)
+    // 1. Sortie de plateau (priorité absolue à la victoire et aux points)
     if m.kind == MoveKind::Exit {
         return SCORE_EXIT;
     }
@@ -27,12 +27,12 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
     }
 
     // 3. Avancée vers le camp adverse
-    if m.target != 255 {
-        let target_case = m.target as usize;
+    if m.to != 255 {
+        let target_case = m.to as usize;
         let target_y = (target_case / 10) as i32;
 
-        // Rouge (1) progresse vers le bas (y=9), Bleu (2) vers le haut (y=0)
-        let forward_progress = if state.side_to_move == 1 {
+        // Camp 1 (Rouge) avance vers le bas (y=9), Camp 2 (Bleu) vers le haut (y=0)
+        let forward_progress = if state.to_move == 1 {
             target_y
         } else {
             9 - target_y
@@ -40,7 +40,7 @@ fn evaluate_move(turn: &Turn, move_idx: usize) -> i32 {
 
         score += forward_progress * WEIGHT_FORWARD_PROGRESS;
 
-        // Pénalité sur le coût en points de mouvement (dénivelé / détours inutiles)
+        // Pénalité sur le coût en points de mouvement (dénivelé et détours inutiles)
         score -= (m.cost as i32) * WEIGHT_EFFICIENT_MOVE;
     }
 
