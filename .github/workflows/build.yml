@@ -1,4 +1,4 @@
-name: Neural Network Bot Build & Duel
+name: NNUE Alpha-Beta Bot Build and Duel
 
 on: [push, workflow_dispatch]
 
@@ -16,8 +16,8 @@ jobs:
       - name: Install Python dependencies
         run: pip install numpy
 
-      - name: Train and Export Neural Network Weights
-        run: python scripts/train_nn.py
+      - name: Generate Quantized NNUE Weights
+        run: python scripts/gen_nnue.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -27,7 +27,7 @@ jobs:
       - name: Build WASM Bot
         run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Checkout Arena SDK
+      - name: Checkout Traversal Arena SDK
         uses: actions/checkout@v4
         with:
           repository: Sylv-Lej/traversal-rust-sdk
@@ -38,12 +38,12 @@ jobs:
           cd arena-sdk
           docker build -f arena/Dockerfile -t traversal-arena .
 
-      - name: Duel Against Reference Bot (Sommet)
+      - name: Duel Against Sommet
         run: |
           docker run --rm -v "$PWD":/w traversal-arena duel /w/target/wasm32-unknown-unknown/release/mon_bot.wasm sommet --games 20
 
       - name: Upload Bot
         uses: actions/upload-artifact@v4
         with:
-          name: mon_bot_nn_wasm
+          name: mon_bot_nnue_wasm
           path: target/wasm32-unknown-unknown/release/*.wasm
