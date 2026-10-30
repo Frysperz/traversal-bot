@@ -1,4 +1,11 @@
-use mon_bot::engine::{FastBoard, FastMove, FastMoveKind, MAX_MOVES, NO_PIECE};
+#[path = "../nnue.rs"]
+mod nnue;
+
+#[path = "../engine.rs"]
+mod engine;
+
+use engine::{FastBoard, FastMove, FastMoveKind, FastPiece, MAX_MOVES, NO_PIECE};
+use nnue::get_feature_index;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
@@ -10,7 +17,6 @@ fn setup_initial_board() -> FastBoard {
     for sq in 0..100 {
         let x = (sq % 10) as i32;
         let y = (sq / 10) as i32;
-        // Colline centrale
         let dist_center = ((x - 4).abs().max((x - 5).abs()) + (y - 4).abs().max((y - 5).abs())) as u8;
         board.heights[sq] = 4u8.saturating_sub(dist_center / 2);
     }
@@ -18,38 +24,38 @@ fn setup_initial_board() -> FastBoard {
     // Camp 1 (Rouge) : rangée y=0 et y=1
     let mut idx = 0;
     // Sentinelle en (4, 0)
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 4, kind: 2, owner: 1, alive: true };
+    board.pieces[idx] = FastPiece { sq: 4, kind: 2, owner: 1, alive: true };
     board.grid[4] = idx as u8;
     idx += 1;
     // Avant-gardes en (3, 0) et (5, 0)
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 3, kind: 1, owner: 1, alive: true };
+    board.pieces[idx] = FastPiece { sq: 3, kind: 1, owner: 1, alive: true };
     board.grid[3] = idx as u8;
     idx += 1;
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 5, kind: 1, owner: 1, alive: true };
+    board.pieces[idx] = FastPiece { sq: 5, kind: 1, owner: 1, alive: true };
     board.grid[5] = idx as u8;
     idx += 1;
     // Explorateurs
     for &sq in &[12, 14, 16] {
-        board.pieces[idx] = mon_bot::engine::FastPiece { sq, kind: 0, owner: 1, alive: true };
+        board.pieces[idx] = FastPiece { sq, kind: 0, owner: 1, alive: true };
         board.grid[sq as usize] = idx as u8;
         idx += 1;
     }
 
     // Camp 2 (Bleu) : rangée y=9 et y=8
     // Sentinelle en (5, 9)
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 95, kind: 2, owner: 2, alive: true };
+    board.pieces[idx] = FastPiece { sq: 95, kind: 2, owner: 2, alive: true };
     board.grid[95] = idx as u8;
     idx += 1;
     // Avant-gardes en (4, 9) et (6, 9)
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 94, kind: 1, owner: 2, alive: true };
+    board.pieces[idx] = FastPiece { sq: 94, kind: 1, owner: 2, alive: true };
     board.grid[94] = idx as u8;
     idx += 1;
-    board.pieces[idx] = mon_bot::engine::FastPiece { sq: 96, kind: 1, owner: 2, alive: true };
+    board.pieces[idx] = FastPiece { sq: 96, kind: 1, owner: 2, alive: true };
     board.grid[96] = idx as u8;
     idx += 1;
     // Explorateurs
     for &sq in &[83, 85, 87] {
-        board.pieces[idx] = mon_bot::engine::FastPiece { sq, kind: 0, owner: 2, alive: true };
+        board.pieces[idx] = FastPiece { sq, kind: 0, owner: 2, alive: true };
         board.grid[sq as usize] = idx as u8;
         idx += 1;
     }
@@ -97,27 +103,22 @@ fn main() {
 
             let move_count = board.generate_moves(&mut move_buffer);
             if move_count == 0 {
-                // Bloqué sans coup : défaite du joueur au trait
                 winner = if board.to_move == 1 { 2 } else { 1 };
                 break;
             }
 
-            // Enregistrement des features actives pour le dataset
             let mut active_features = Vec::new();
             for i in 0..board.piece_count {
                 let p = &board.pieces[i];
                 if p.alive && p.sq != 255 {
-                    active_features.push(mon_bot::nnue::get_feature_index(p.sq, p.kind, p.owner) as u16);
+                    active_features.push(get_feature_index(p.sq, p.kind, p.owner) as u16);
                 }
             }
             history.push((active_features, board.to_move));
 
-            // Sélection du coup (exploration avec léger aléa contrôlé)
             let chosen_idx = if game_id % 5 == 0 {
-                // Aléatoire contrôlé pour diversifier les ouvertures
                 (game_id + _ply) % move_count
             } else {
-                // Coup greedy rapide basé sur l'avancée
                 let mut best = 0;
                 let mut best_val = -9999;
                 for m_idx in 0..move_count {
@@ -148,7 +149,6 @@ fn main() {
             blue_wins += 1;
         }
 
-        // Export des positions étiquetées avec le résultat réel
         for (feats, side) in history {
             let target_result: f32 = if winner == 0 {
                 0.0
