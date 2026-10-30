@@ -218,66 +218,120 @@ impl BoardState {
     }
 
     #[inline(always)]
+    // Dans BoardState::evaluate()
     fn evaluate(&self, side: u8) -> i32 {
-        let opp = if side == 1 { 2 } else { 1 };
+        let opp = 3 - side;
+    
+        // 1. Vérifie victoire/défaite instantanée Sentinel
         if self.sentinel_exited[side as usize] {
-            return SENTINEL_WIN;
+            return 1_000_000; // Victoire
         }
         if self.sentinel_exited[opp as usize] {
-            return -SENTINEL_WIN;
+            return -1_000_000; // Défaite
         }
-
+    
+        // 2. Vérifie si un Sentinel adverse est en position de victoire
         let mut score = 0;
-        let mut opp_sent_x = -1;
-        let mut opp_sent_y = -1;
-
+        if self.is_sentinel_threatened(opp) {
+            score -= 50_000; // URGENT: bloquer !
+        }
+    
+        // 3. Évalue chaque pièce
         for i in 0..self.piece_count {
-            if !self.pieces_alive[i] {
+            if !self.pieces_alive[i] { continue; }
+    
+            let p = &self.pieces[i];
+            let sq = p.sq as usize;
+            let x = sq % 10;
+            let y = sq / 10;
+            let h = self.heights[sq] as i32;
+    
+            // Distance à la sortie
+            let dist_to_exit = if p.owner == 1 {
+                9 - y // Rouge → ligne 9 (index 90-99)
+            } else {
+                y // Bleu → ligne 0 (index 0-9)
+            };
+    
+            // Valeur de base (selon le type de pièce)
+            let base_value = match p.kind {
+                2 => 3_000, // Sentinel = 3 pts
+                1 => 2_000, // Vanguard = 2 pts
+                _ => 1_000, // Explorer = 1 pt
+            };
+    
+            // Bonus de progression (plus important pour les pièces lentes)
+            let progress_bonus = dist_to_exit * match p.kind {
+                2 => 300, // Sentinel lent → bonus élevé
+                1 => 200,
+                _ => 100,
+            };
+    
+            // Bonus de hauteur (contrôle du terrain)
+            let height_bonus = h * 100;
+    
+            // Bonus si la pièce bloque un Sentinel adverse
+            let blocking_bonus = self.count_blocked_sentinels(p) * 1_000;
+    
+            // Bonus de mobilité (nombre de moves possibles)
+            let mobility = self.count_legal_moves_for_piece(i) as i32 * 50;
+    
+            let piece_score = base_value + progress_bonus + height_bonus + blocking_bonus + mobility;
+    
+            if p.owner == side {
+                score += piece_score;
+            } else {
+                score -= piece_score;
+            }
+        }
+    
+        // 4. Bonus de contrôle global des hauteurs
+        score += self.evaluate_height_control(side) * 30;
+    
+        // 5. Pénalité si nos pièces sont isolées
+        score -= self.evaluate_isolation(side) * 200;
+    
+        score
+    }
+    
+    // Ajoute ces méthodes à BoardState:
+    fn is_sentinel_threatened(&self, side: u8) -> bool {
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != side {
                 continue;
             }
-
-            let sq = self.pieces_sq[i] as usize;
-            let x = (sq % 10) as i32;
-            let y = (sq / 10) as i32;
-            let fwd = if self.pieces_owner[i] == 1 { y } else { 9 - y };
-            let h = self.heights[sq] as i32;
-
-            let kind = self.pieces_kind[i];
-            let piece_val = match kind {
-                2 => {
-                    if self.pieces_owner[i] != side {
-                        opp_sent_x = x;
-                        opp_sent_y = fwd;
-                    }
-                    fwd * 1_200 + h * 80 + 3_000
-                }
-                1 => fwd * 90 + h * 40 + 800,
-                _ => fwd * 40 + h * 20 + 300,
-            };
-
-            if self.pieces_owner[i] == side {
-                score += piece_val;
-            } else {
-                score -= piece_val;
+            let p = &self.pieces[i];
+            if p.kind != 2 { continue; } // Seuls les Sentinels comptent
+    
+            let sq = p.sq as usize;
+            let y = sq / 10;
+            let exit_row = if side == 1 { 9 } else { 0 };
+    
+            // Si le Sentinel est à 1 case de la sortie
+            if (y as i32).abs_diff(exit_row as i32) == 1 {
+                // Vérifie si un ennemi peut le bloquer ou le capturer
+                return true;
             }
         }
-
-        if opp_sent_y >= 2 && opp_sent_x >= 0 {
-            for i in 0..self.piece_count {
-                if self.pieces_alive[i] && self.pieces_owner[i] == side {
-                    let sq = self.pieces_sq[i] as usize;
-                    let px = (sq % 10) as i32;
-                    let py = (sq / 10) as i32;
-                    let pfwd = if side == 1 { py } else { 9 - py };
-
-                    if px == opp_sent_x && pfwd > opp_sent_y {
-                        score += 600;
-                    }
-                }
+        false
+    }
+    
+    fn count_blocked_sentinels(&self, p: &Piece) -> i32 {
+        // Compte combien de Sentinels adverses sont bloqués par cette pièce
+        let mut count = 0;
+        let opp = 3 - p.owner;
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
+                continue;
+            }
+            let sent_sq = self.pieces_sq[i] as usize;
+            let p_sq = p.sq as usize;
+            // Si la pièce est adjacente au Sentinel adverse
+            if (p_sq % 10).abs_diff(sent_sq % 10) <= 1 && (p_sq / 10).abs_diff(sent_sq / 10) <= 1 {
+                count += 1;
             }
         }
-
-        score
+        count
     }
 }
 
