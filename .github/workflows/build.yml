@@ -1,33 +1,36 @@
-name: NNUE Alpha-Beta Bot Build and Duel
+name: Full NNUE Pipeline and Duel
 
 on: [push, workflow_dispatch]
 
 jobs:
-  build-and-test:
+  train-and-duel:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install Python Dependencies
         run: pip install numpy
 
-      - name: Generate Quantized NNUE Weights
-        run: python scripts/gen_nnue.py
+      - name: Run High-Speed Self-Play
+        run: cargo run --release --bin selfplay
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Train NNUE Weights
+        run: python scripts/train_nnue.py
 
       - name: Build WASM Bot
         run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Checkout Traversal Arena SDK
+      - name: Checkout Arena SDK
         uses: actions/checkout@v4
         with:
           repository: Sylv-Lej/traversal-rust-sdk
@@ -38,12 +41,12 @@ jobs:
           cd arena-sdk
           docker build -f arena/Dockerfile -t traversal-arena .
 
-      - name: Duel Against Sommet
+      - name: Duel Against Reference Bot (Sommet)
         run: |
           docker run --rm -v "$PWD":/w traversal-arena duel /w/target/wasm32-unknown-unknown/release/mon_bot.wasm sommet --games 20
 
-      - name: Upload Bot
+      - name: Upload Bot WASM
         uses: actions/upload-artifact@v4
         with:
-          name: mon_bot_nnue_wasm
+          name: mon_bot_wasm
           path: target/wasm32-unknown-unknown/release/*.wasm
