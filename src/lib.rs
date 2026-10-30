@@ -1,5 +1,3 @@
-// COPIE CE CODE DANS https://github.com/Frysperz/traversal-bot/edit/main/src/lib.rs
-
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
 
@@ -217,6 +215,7 @@ impl BoardState {
                 }
             }
 
+            // Règles spéciales pour Explorer
             if kind == 0 {
                 for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
                     let nx = x + dx;
@@ -264,20 +263,56 @@ impl BoardState {
     fn evaluate(&self, side: u8) -> i32 {
         let opp = 3 - side;
 
+        // 1. Vérifie victoire/défaite instantanée Sentinel
         if self.sentinel_exited[side as usize] {
-            return 1_000_000;
+            return 10_000_000; // Victoire instantanée
         }
         if self.sentinel_exited[opp as usize] {
-            return -1_000_000;
+            return -10_000_000; // Défaite instantanée
         }
 
         let mut score: i32 = 0;
-        if self.is_sentinel_threatened(opp) {
-            score -= 50_000;
+
+        // 2. Bonus exponentiel pour Sentinels proches de la sortie
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_kind[i] != 2 { continue; }
+
+            let sq = self.pieces_sq[i] as usize;
+            let y = sq / 10;
+            let exit_row = if self.pieces_owner[i] == 1 { 9 } else { 0 };
+            let distance = (y as i32).abs_diff(exit_row as i32);
+
+            if self.pieces_owner[i] == side {
+                // NOUS: Bonus énorme si proche de la sortie
+                score += match distance {
+                    0 => 10_000_000,  // Sur la ligne de sortie
+                    1 => 8_000_000,    // À 1 case
+                    2 => 5_000_000,    // À 2 cases
+                    3 => 2_000_000,    // À 3 cases
+                    4 => 1_000_000,    // À 4 cases
+                    _ => 500_000,      // Plus loin
+                };
+            } else {
+                // ADVERSAIRE: Pénalité énorme si proche de la sortie
+                score -= match distance {
+                    0 => 15_000_000,  // Sur la ligne → PERDU si on ne bloque pas
+                    1 => 10_000_000,  // À 1 case → DANGER IMMÉDIAT
+                    2 => 6_000_000,   // À 2 cases
+                    3 => 3_000_000,   // À 3 cases
+                    4 => 1_500_000,   // À 4 cases
+                    _ => 500_000,     // Plus loin
+                };
+            }
         }
 
+        // 3. Vérifie si un Sentinel adverse est en position de victoire immédiate
+        if self.is_sentinel_threatened(opp) {
+            score -= 20_000_000; // URGENCE ABSOLUE: bloquer !
+        }
+
+        // 4. Évalue chaque pièce (autres que Sentinels)
         for i in 0..self.piece_count {
-            if !self.pieces_alive[i] { continue; }
+            if !self.pieces_alive[i] || self.pieces_kind[i] == 2 { continue; } // Sentinels déjà traités
 
             let sq = self.pieces_sq[i] as usize;
             let kind = self.pieces_kind[i];
@@ -292,13 +327,11 @@ impl BoardState {
             };
 
             let base_value: i32 = match kind {
-                2 => 3_000,
-                1 => 2_000,
-                _ => 1_000,
+                1 => 2_000, // Vanguard = 2 pts
+                _ => 1_000, // Explorer = 1 pt
             };
 
             let progress_bonus: i32 = dist_to_exit * match kind {
-                2 => 300,
                 1 => 200,
                 _ => 100,
             };
@@ -316,7 +349,10 @@ impl BoardState {
             }
         }
 
+        // 5. Bonus de contrôle global des hauteurs
         score += self.evaluate_height_control(side) * 30;
+
+        // 6. Pénalité si nos pièces sont isolées
         score -= self.evaluate_isolation(side) * 200;
 
         score
@@ -324,18 +360,43 @@ impl BoardState {
 
     fn is_sentinel_threatened(&self, side: u8) -> bool {
         for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != side {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != side || self.pieces_kind[i] != 2 {
                 continue;
             }
-            let kind = self.pieces_kind[i];
-            if kind != 2 { continue; }
-
             let sq = self.pieces_sq[i] as usize;
             let y = sq / 10;
             let exit_row = if side == 1 { 9 } else { 0 };
 
-            if (y as i32).abs_diff(exit_row as i32) == 1 {
+            if (y as i32).abs_diff(exit_row as i32) <= 1 {
                 return true;
+            }
+        }
+        false
+    }
+
+    fn blocks_sentinel_threat(&self, to_sq: u8, side: u8) -> bool {
+        let to_sq = to_sq as usize;
+        let to_x = to_sq % 10;
+        let to_y = to_sq / 10;
+
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != side || self.pieces_kind[i] != 2 {
+                continue;
+            }
+            let sent_sq = self.pieces_sq[i] as usize;
+            let sent_x = sent_sq % 10;
+            let sent_y = sent_sq / 10;
+            let exit_row = if side == 1 { 9 } else { 0 };
+
+            if (sent_y as i32).abs_diff(exit_row as i32) == 1 {
+                // Vérifie si on se place juste devant ou sur le chemin
+                if (to_y as i32).abs_diff(sent_y as i32) <= 1 && (to_x as i32).abs_diff(sent_x as i32) <= 1 {
+                    return true;
+                }
+                // Ou sur la ligne de sortie
+                if to_y == exit_row && to_x == sent_x {
+                    return true;
+                }
             }
         }
         false
@@ -536,6 +597,63 @@ impl BoardState {
     }
 }
 
+fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8, board: &BoardState) {
+    moves[..count].sort_unstable_by(|a, b| {
+        let mut score_a = 0;
+        let mut score_b = 0;
+
+        // 1. TT move
+        if a.to == tt_move_sq && tt_move_sq != 255 { score_a += 10_000_000; }
+        if b.to == tt_move_sq && tt_move_sq != 255 { score_b += 10_000_000; }
+
+        // 2. SENTINEL EXIT = PRIORITÉ ABSOLUE
+        if a.kind == SimMoveKind::Exit && board.pieces_kind[a.piece_idx as usize] == 2 {
+            score_a += 100_000_000;
+        }
+        if b.kind == SimMoveKind::Exit && board.pieces_kind[b.piece_idx as usize] == 2 {
+            score_b += 100_000_000;
+        }
+
+        // 3. BLOQUER SENTINEL ADVERSE
+        if a.kind == SimMoveKind::Move && board.blocks_sentinel_threat(a.to, 3 - board.to_move) {
+            score_a += 90_000_000;
+        }
+        if b.kind == SimMoveKind::Move && board.blocks_sentinel_threat(b.to, 3 - board.to_move) {
+            score_b += 90_000_000;
+        }
+
+        // 4. Exit normal (Explorer/Vanguard)
+        if a.kind == SimMoveKind::Exit { score_a += 5_000_000; }
+        if b.kind == SimMoveKind::Exit { score_b += 5_000_000; }
+
+        // 5. Capture de Sentinel
+        if a.kind == SimMoveKind::Attack && a.captured_idx != 255 && board.pieces_kind[a.captured_idx as usize] == 2 {
+            score_a += 8_000_000;
+        }
+        if b.kind == SimMoveKind::Attack && b.captured_idx != 255 && board.pieces_kind[b.captured_idx as usize] == 2 {
+            score_b += 8_000_000;
+        }
+
+        // 6. Attack normal
+        if a.kind == SimMoveKind::Attack { score_a += 100_000; }
+        if b.kind == SimMoveKind::Attack { score_b += 100_000; }
+
+        // 7. Moves qui avancent vers la sortie
+        if a.kind == SimMoveKind::Move && a.to != 255 {
+            let y = (a.to / 10) as i32;
+            let target_y = if board.pieces_owner[a.piece_idx as usize] == 1 { 9 } else { 0 };
+            score_a += (target_y - y).abs() as i32 * 10_000;
+        }
+        if b.kind == SimMoveKind::Move && b.to != 255 {
+            let y = (b.to / 10) as i32;
+            let target_y = if board.pieces_owner[b.piece_idx as usize] == 1 { 9 } else { 0 };
+            score_b += (target_y - y).abs() as i32 * 10_000;
+        }
+
+        score_b.cmp(&score_a)
+    });
+}
+
 fn quiescence(
     board: &mut BoardState,
     mut alpha: i32,
@@ -576,24 +694,6 @@ fn quiescence(
     }
 
     alpha
-}
-
-fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8) {
-    let slice = &mut moves[..count];
-    slice.sort_unstable_by_key(|m| {
-        let mut p = 0;
-        if m.to == tt_move_sq && tt_move_sq != 255 {
-            p += 1_000_000;
-        }
-        if m.kind == SimMoveKind::Exit {
-            p += 500_000;
-        } else if m.kind == SimMoveKind::Attack {
-            p += 100_000;
-        } else {
-            p -= (m.cost as i32) * 50;
-        }
-        -p
-    });
 }
 
 fn negamax(
@@ -648,7 +748,7 @@ fn negamax(
         return -SENTINEL_WIN + 50;
     }
 
-    order_moves(&mut moves, count, tt_move_sq);
+    order_moves(&mut moves, count, tt_move_sq, board);
 
     let mut max_eval = -INF;
     let mut best_sq = 255;
@@ -703,6 +803,7 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
+    // Si fuel très bas, retourne un move Exit ou Attack rapidement
     if fuel_left() < 50_000_000 {
         for (i, m) in turn.moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
@@ -729,6 +830,7 @@ fn choose(turn: &Turn) -> usize {
     let pieces = state.pieces();
     let my_side = state.to_move;
 
+    // Priorité absolue : faire sortir un Sentinel si possible
     for (i, m) in turn.moves.iter().enumerate() {
         if m.kind == MoveKind::Exit {
             let p = m.piece as usize;
@@ -791,8 +893,13 @@ fn choose(turn: &Turn) -> usize {
 
     root_moves.sort_by_key(|(_, m)| {
         let mut p = 0;
-        if m.kind == SimMoveKind::Exit { p += 100_000; }
-        else if m.kind == SimMoveKind::Attack { p += 20_000; }
+        if m.kind == SimMoveKind::Exit && board.pieces_kind[m.piece_idx as usize] == 2 {
+            p += 1_000_000;
+        } else if m.kind == SimMoveKind::Exit {
+            p += 100_000;
+        } else if m.kind == SimMoveKind::Attack {
+            p += 20_000;
+        }
         -p
     });
 
