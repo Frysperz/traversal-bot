@@ -1,3 +1,5 @@
+// COPIE CE CODE DANS https://github.com/Frysperz/traversal-bot/edit/main/src/lib.rs
+
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
 
@@ -6,7 +8,6 @@ const INF: i32 = 2_000_000;
 const SENTINEL_WIN: i32 = 1_000_000;
 const MAX_DEPTH: usize = 14;
 
-// Table de transposition calibrée sous 300 Ko
 const TT_SIZE: usize = 1 << 14;
 const TT_MASK: usize = TT_SIZE - 1;
 
@@ -50,14 +51,15 @@ fn zobrist_hash(grid: &[u8; 100], to_move: u8) -> u64 {
     h
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SimMoveKind {
+    #[default]
     Move,
     Attack,
     Exit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SimMove {
     pub piece_idx: u8,
     pub from: u8,
@@ -78,51 +80,6 @@ pub struct BoardState {
     pub heights: [u8; 100],
     pub to_move: u8,
     pub sentinel_exited: [bool; 3],
-}
-
-fn quiescence(
-    board: &mut BoardState,
-    mut alpha: i32,
-    beta: i32,
-    aborted: &mut bool,
-) -> i32 {
-    if fuel_left() < SAFETY_FUEL {
-        *aborted = true;
-        return 0;
-    }
-
-    let stand_pat = board.evaluate(board.to_move);
-    if stand_pat >= beta {
-        return beta;
-    }
-    alpha = alpha.max(stand_pat);
-
-    // Génère seulement les captures
-    let mut captures = [SimMove::default(); 64];
-    let cap_count = board.generate_captures(&mut captures);
-
-    // Trie les captures (MVV/LVA: Most Valuable Victim / Least Valuable Attacker)
-    order_captures(&mut captures, cap_count);
-
-    for i in 0..cap_count {
-        let m = captures[i];
-        let (prev_sq, captured, exited) = board.apply(m);
-
-        let score = -quiescence(board, -beta, -alpha, aborted);
-
-        board.unmake(m, prev_sq, captured, exited);
-
-        if *aborted {
-            return 0;
-        }
-
-        if score >= beta {
-            return beta;
-        }
-        alpha = alpha.max(score);
-    }
-
-    alpha
 }
 
 impl BoardState {
@@ -205,6 +162,7 @@ impl BoardState {
             let x = (sq % 10) as i32;
             let y = (sq / 10) as i32;
             let ch = self.heights[sq] as i32;
+            let kind = self.pieces_kind[i];
 
             if y == exit_row && count < 64 {
                 buffer[count] = SimMove {
@@ -241,7 +199,7 @@ impl BoardState {
                             count += 1;
                         }
                     } else if self.pieces_owner[occ as usize] == opp {
-                        let att = match self.pieces_kind[i] { 2 => 3, 1 => 2, _ => 1 } + if ch > nh { 1 } else { 0 };
+                        let att = match kind { 2 => 3, 1 => 2, _ => 1 } + if ch > nh { 1 } else { 0 };
                         let def = match self.pieces_kind[occ as usize] { 2 => 3, 1 => 2, _ => 1 } + if nh > ch { 1 } else { 0 };
 
                         if att >= def && count < 64 {
@@ -258,212 +216,283 @@ impl BoardState {
                     }
                 }
             }
-            // Dans BoardState::generate_moves():
-// Ajoute après les mouvements normaux:
 
-// --- RÈGLES SPÉCIALES ---
-if self.pieces_kind[i] == 0 {  // Explorer
-    let sq = self.pieces_sq[i] as usize;
-    let x = (sq % 10) as i32;
-    let y = (sq / 10) as i32;
+            if kind == 0 {
+                for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                        let nsq = (ny * 10 + nx) as usize;
+                        if self.grid[nsq] == 255 && count < 64 {
+                            buffer[count] = SimMove {
+                                piece_idx: i as u8,
+                                from: sq as u8,
+                                to: nsq as u8,
+                                kind: SimMoveKind::Move,
+                                cost: 1,
+                                captured_idx: 255,
+                            };
+                            count += 1;
+                        }
+                    }
+                }
 
-    // Diagonale (1 case)
-    for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-        let nx = x + dx;
-        let ny = y + dy;
-        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-            let nsq = (ny * 10 + nx) as usize;
-            if self.grid[nsq] == 255 && count < 64 {
-                buffer[count] = SimMove {
-                    piece_idx: i as u8,
-                    from: sq as u8,
-                    to: nsq as u8,
-                    kind: SimMoveKind::Move,
-                    cost: 1, // Coût fixe pour diagonal
-                    captured_idx: 255,
-                };
-                count += 1;
+                for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                        let nsq = (ny * 10 + nx) as usize;
+                        if self.grid[nsq] == 255 && count < 64 {
+                            buffer[count] = SimMove {
+                                piece_idx: i as u8,
+                                from: sq as u8,
+                                to: nsq as u8,
+                                kind: SimMoveKind::Move,
+                                cost: 1,
+                                captured_idx: 255,
+                            };
+                            count += 1;
+                        }
+                    }
+                }
             }
-        }
-    }
-
-    // Leap (2 cases orthogonales)
-    for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
-        let nx = x + dx;
-        let ny = y + dy;
-        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-            let nsq = (ny * 10 + nx) as usize;
-            if self.grid[nsq] == 255 && count < 64 {
-                buffer[count] = SimMove {
-                    piece_idx: i as u8,
-                    from: sq as u8,
-                    to: nsq as u8,
-                    kind: SimMoveKind::Move,
-                    cost: 1, // Coût fixe pour leap
-                    captured_idx: 255,
-                };
-                count += 1;
-            }
-        }
-    }
-}
-
-// Vanguard: Bonus +1 si mouvement = 4 cases (à gérer dans l'évaluation des attaques)
         }
         count
     }
 
     #[inline(always)]
-    // Dans BoardState::evaluate()
     fn evaluate(&self, side: u8) -> i32 {
         let opp = 3 - side;
-    
-        // 1. Vérifie victoire/défaite instantanée Sentinel
+
         if self.sentinel_exited[side as usize] {
-            return 1_000_000; // Victoire
+            return 1_000_000;
         }
         if self.sentinel_exited[opp as usize] {
-            return -1_000_000; // Défaite
+            return -1_000_000;
         }
-    
-        // 2. Vérifie si un Sentinel adverse est en position de victoire
-        let mut score = 0;
+
+        let mut score: i32 = 0;
         if self.is_sentinel_threatened(opp) {
-            score -= 50_000; // URGENT: bloquer !
+            score -= 50_000;
         }
-    
-        // 3. Évalue chaque pièce
+
         for i in 0..self.piece_count {
             if !self.pieces_alive[i] { continue; }
-    
-            let p = &self.pieces[i];
-            let sq = p.sq as usize;
-            let x = sq % 10;
+
+            let sq = self.pieces_sq[i] as usize;
+            let kind = self.pieces_kind[i];
+            let owner = self.pieces_owner[i];
             let y = sq / 10;
             let h = self.heights[sq] as i32;
-    
-            // Distance à la sortie
-            let dist_to_exit = if p.owner == 1 {
-                9 - y // Rouge → ligne 9 (index 90-99)
+
+            let dist_to_exit: i32 = if owner == 1 {
+                9 - y as i32
             } else {
-                y // Bleu → ligne 0 (index 0-9)
+                y as i32
             };
-    
-            // Valeur de base (selon le type de pièce)
-            let base_value = match p.kind {
-                2 => 3_000, // Sentinel = 3 pts
-                1 => 2_000, // Vanguard = 2 pts
-                _ => 1_000, // Explorer = 1 pt
+
+            let base_value: i32 = match kind {
+                2 => 3_000,
+                1 => 2_000,
+                _ => 1_000,
             };
-    
-            // Bonus de progression (plus important pour les pièces lentes)
-            let progress_bonus = dist_to_exit * match p.kind {
-                2 => 300, // Sentinel lent → bonus élevé
+
+            let progress_bonus: i32 = dist_to_exit * match kind {
+                2 => 300,
                 1 => 200,
                 _ => 100,
             };
-    
-            // Bonus de hauteur (contrôle du terrain)
-            let height_bonus = h * 100;
-    
-            // Bonus si la pièce bloque un Sentinel adverse
-            let blocking_bonus = self.count_blocked_sentinels(p) * 1_000;
-    
-            // Bonus de mobilité (nombre de moves possibles)
-            let mobility = self.count_legal_moves_for_piece(i) as i32 * 50;
-    
-            let piece_score = base_value + progress_bonus + height_bonus + blocking_bonus + mobility;
-    
-            if p.owner == side {
+
+            let height_bonus: i32 = h * 100;
+            let blocking_bonus: i32 = self.count_blocked_sentinels(i) as i32 * 1_000;
+            let mobility: i32 = self.count_legal_moves_for_piece(i) as i32 * 50;
+
+            let piece_score: i32 = base_value + progress_bonus + height_bonus + blocking_bonus + mobility;
+
+            if owner == side {
                 score += piece_score;
             } else {
                 score -= piece_score;
             }
         }
-    
-        // 4. Bonus de contrôle global des hauteurs
+
         score += self.evaluate_height_control(side) * 30;
-    
-        // 5. Pénalité si nos pièces sont isolées
         score -= self.evaluate_isolation(side) * 200;
-    
+
         score
     }
-    
-    // Ajoute ces méthodes à BoardState:
+
     fn is_sentinel_threatened(&self, side: u8) -> bool {
         for i in 0..self.piece_count {
             if !self.pieces_alive[i] || self.pieces_owner[i] != side {
                 continue;
             }
-            let p = &self.pieces[i];
-            if p.kind != 2 { continue; } // Seuls les Sentinels comptent
-    
-            let sq = p.sq as usize;
+            let kind = self.pieces_kind[i];
+            if kind != 2 { continue; }
+
+            let sq = self.pieces_sq[i] as usize;
             let y = sq / 10;
             let exit_row = if side == 1 { 9 } else { 0 };
-    
-            // Si le Sentinel est à 1 case de la sortie
+
             if (y as i32).abs_diff(exit_row as i32) == 1 {
-                // Vérifie si un ennemi peut le bloquer ou le capturer
                 return true;
             }
         }
         false
     }
-    
-    fn count_blocked_sentinels(&self, p: &Piece) -> i32 {
-        // Compte combien de Sentinels adverses sont bloqués par cette pièce
+
+    fn count_blocked_sentinels(&self, piece_idx: usize) -> i32 {
         let mut count = 0;
-        let opp = 3 - p.owner;
+        let piece_sq = self.pieces_sq[piece_idx] as usize;
+        let piece_owner = self.pieces_owner[piece_idx];
+        let opp = 3 - piece_owner;
         for i in 0..self.piece_count {
             if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
                 continue;
             }
             let sent_sq = self.pieces_sq[i] as usize;
-            let p_sq = p.sq as usize;
-            // Si la pièce est adjacente au Sentinel adverse
-            if (p_sq % 10).abs_diff(sent_sq % 10) <= 1 && (p_sq / 10).abs_diff(sent_sq / 10) <= 1 {
+            if (piece_sq % 10).abs_diff(sent_sq % 10) <= 1 && (piece_sq / 10).abs_diff(sent_sq / 10) <= 1 {
                 count += 1;
             }
         }
         count
     }
 
+    fn count_legal_moves_for_piece(&self, piece_idx: usize) -> usize {
+        let mut count = 0;
+        let sq = self.pieces_sq[piece_idx] as usize;
+        let x = (sq % 10) as i32;
+        let y = (sq / 10) as i32;
+        let ch = self.heights[sq] as i32;
+        let kind = self.pieces_kind[piece_idx];
+        let owner = self.pieces_owner[piece_idx];
+        let exit_row = if owner == 1 { 9 } else { 0 };
+
+        if y == exit_row {
+            count += 1;
+        }
+
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                let nsq = (ny * 10 + nx) as usize;
+                if self.grid[nsq] == 255 {
+                    count += 1;
+                } else if self.pieces_owner[self.grid[nsq] as usize] != owner {
+                    let att_str = match kind { 2 => 3, 1 => 2, _ => 1 } + if ch > self.heights[nsq] as i32 { 1 } else { 0 };
+                    let def_str = match self.pieces_kind[self.grid[nsq] as usize] { 2 => 3, 1 => 2, _ => 1 } + if self.heights[nsq] as i32 > ch { 1 } else { 0 };
+                    if att_str >= def_str {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        if kind == 0 {
+            for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 && self.grid[(ny * 10 + nx) as usize] == 255 {
+                    count += 1;
+                }
+            }
+            for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 && self.grid[(ny * 10 + nx) as usize] == 255 {
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    fn evaluate_height_control(&self, side: u8) -> i32 {
+        let mut score = 0;
+        for sq in 0..100 {
+            let h = self.heights[sq] as i32;
+            if self.grid[sq] != 255 {
+                let piece_idx = self.grid[sq] as usize;
+                if self.pieces_owner[piece_idx] == side {
+                    score += h * 2;
+                } else {
+                    score -= h;
+                }
+            }
+        }
+        score
+    }
+
+    fn evaluate_isolation(&self, side: u8) -> i32 {
+        let mut isolation_penalty = 0;
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != side {
+                continue;
+            }
+            let sq = self.pieces_sq[i] as usize;
+            let x = sq % 10;
+            let y = sq / 10;
+            let mut has_ally_adjacent = false;
+
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                    let nsq = (ny * 10 + nx) as usize;
+                    if self.grid[nsq] != 255 {
+                        let other_idx = self.grid[nsq] as usize;
+                        if self.pieces_owner[other_idx] == side {
+                            has_ally_adjacent = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !has_ally_adjacent {
+                isolation_penalty += 1;
+            }
+        }
+        isolation_penalty
+    }
+
     fn generate_captures(&self, buffer: &mut [SimMove; 64]) -> usize {
         let mut count = 0;
         let opp = if self.to_move == 1 { 2 } else { 1 };
-    
+
         for i in 0..self.piece_count {
             if !self.pieces_alive[i] || self.pieces_owner[i] != self.to_move {
                 continue;
             }
-    
+
             let sq = self.pieces_sq[i] as usize;
             let x = (sq % 10) as i32;
             let y = (sq / 10) as i32;
             let ch = self.heights[sq] as i32;
-    
+            let kind = self.pieces_kind[i];
+
             for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                 let nx = x + dx;
                 let ny = y + dy;
-    
+
                 if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
                     let nsq = (ny * 10 + nx) as usize;
                     let target = self.grid[nsq];
                     if target != 255 && self.pieces_owner[target as usize] == opp {
-                        let att_str = match self.pieces_kind[i] {
+                        let att_str = match kind {
                             2 => 3,
                             1 => 2,
                             _ => 1,
                         } + if ch > self.heights[nsq] as i32 { 1 } else { 0 };
-    
+
                         let def_str = match self.pieces_kind[target as usize] {
                             2 => 3,
                             1 => 2,
                             _ => 1,
                         } + if self.heights[nsq] as i32 > ch { 1 } else { 0 };
-    
+
                         if att_str >= def_str && count < 64 {
                             buffer[count] = SimMove {
                                 piece_idx: i as u8,
@@ -481,29 +510,72 @@ if self.pieces_kind[i] == 0 {  // Explorer
         }
         count
     }
-    
-    fn order_captures(moves: &mut [SimMove; 64], count: usize) {
+
+    fn order_captures(&self, moves: &mut [SimMove; 64], count: usize) {
         moves[..count].sort_unstable_by(|a, b| {
-            // MVV/LVA: Priorité aux captures de pièces fortes avec des pièces faibles
-            let a_val = match a.captured_idx {
-                255 => 0,
-                idx => match moves[idx as usize].kind {
+            let a_val = if a.captured_idx != 255 {
+                match self.pieces_kind[a.captured_idx as usize] {
                     2 => 3,
                     1 => 2,
                     _ => 1,
-                },
+                }
+            } else {
+                0
             };
-            let b_val = match b.captured_idx {
-                255 => 0,
-                idx => match moves[idx as usize].kind {
+            let b_val = if b.captured_idx != 255 {
+                match self.pieces_kind[b.captured_idx as usize] {
                     2 => 3,
                     1 => 2,
                     _ => 1,
-                },
+                }
+            } else {
+                0
             };
             b_val.cmp(&a_val)
         });
     }
+}
+
+fn quiescence(
+    board: &mut BoardState,
+    mut alpha: i32,
+    beta: i32,
+    aborted: &mut bool,
+) -> i32 {
+    if fuel_left() < SAFETY_FUEL {
+        *aborted = true;
+        return 0;
+    }
+
+    let stand_pat = board.evaluate(board.to_move);
+    if stand_pat >= beta {
+        return beta;
+    }
+    alpha = alpha.max(stand_pat);
+
+    let mut captures = [SimMove::default(); 64];
+    let cap_count = board.generate_captures(&mut captures);
+    board.order_captures(&mut captures, cap_count);
+
+    for i in 0..cap_count {
+        let m = captures[i];
+        let (prev_sq, captured, exited) = board.apply(m);
+
+        let score = -quiescence(board, -beta, -alpha, aborted);
+
+        board.unmake(m, prev_sq, captured, exited);
+
+        if *aborted {
+            return 0;
+        }
+
+        if score >= beta {
+            return beta;
+        }
+        alpha = alpha.max(score);
+    }
+
+    alpha
 }
 
 fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8) {
@@ -561,20 +633,17 @@ fn negamax(
         }
     }
 
-    if board.sentinel_exited[1] || board.sentinel_exited[2] || depth == 0 {
+    if board.sentinel_exited[1] || board.sentinel_exited[2] {
         return board.evaluate(board.to_move);
     }
 
-    let mut moves = [SimMove {
-        piece_idx: 0,
-        from: 0,
-        to: 0,
-        kind: SimMoveKind::Move,
-        cost: 0,
-        captured_idx: 255,
-    }; 64];
+    if depth == 0 {
+        return quiescence(board, -INF, INF, aborted);
+    }
 
+    let mut moves = [SimMove::default(); 64];
     let count = board.generate_moves(&mut moves);
+
     if count == 0 {
         return -SENTINEL_WIN + 50;
     }
@@ -634,7 +703,6 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // Si fuel très bas, retourne un move Exit ou Attack rapidement
     if fuel_left() < 50_000_000 {
         for (i, m) in turn.moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
@@ -649,7 +717,6 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // Sinon, lance Negamax avec profondeur adaptative
     let max_depth = if fuel_left() > 1_000_000_000 {
         12
     } else if fuel_left() > 500_000_000 {
@@ -657,10 +724,6 @@ fn choose(turn: &Turn) -> usize {
     } else {
         8
     };
-    
-    if turn.moves.is_empty() {
-        return 0;
-    }
 
     let state = &turn.state;
     let pieces = state.pieces();
@@ -735,7 +798,7 @@ fn choose(turn: &Turn) -> usize {
 
     let mut best_move_idx = root_moves[0].0;
 
-    for depth in 1..=MAX_DEPTH {
+    for depth in 1..=max_depth.min(MAX_DEPTH) {
         if fuel_left() < SAFETY_FUEL {
             break;
         }
@@ -752,9 +815,7 @@ fn choose(turn: &Turn) -> usize {
             }
 
             let (prev_sq, captured, exited) = board.apply(m);
-
             let score = -negamax(&mut board, depth - 1, -beta, -alpha, &mut aborted);
-
             board.unmake(m, prev_sq, captured, exited);
 
             if aborted {
