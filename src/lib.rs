@@ -1,18 +1,18 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
 
-// Consommer le maximum de fuel sans jamais risquer la faute
-const SAFETY_FUEL: u64 = 150_000_000; // Arrêt propre dès qu'il reste moins de 150M de fuel
+const SAFETY_FUEL: u64 = 150_000_000;
 const INF: i32 = 2_000_000;
 const SENTINEL_WIN: i32 = 1_000_000;
 const MAX_DEPTH: usize = 14;
 
-// Table de transposition : 2^18 entrées = 262 144 positions (~4 Mo de RAM, limite à 64 Mo)
-const TT_SIZE: usize = 1 << 18;
+// Table de transposition calibrée sous 300 Ko
+const TT_SIZE: usize = 1 << 14;
 const TT_MASK: usize = TT_SIZE - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TTFlag {
+    None,
     Exact,
     LowerBound,
     UpperBound,
@@ -27,9 +27,14 @@ struct TTEntry {
     best_move_sq: u8,
 }
 
-static mut TT: [Option<TTEntry>; TT_SIZE] = [None; TT_SIZE];
+static mut TT: [TTEntry; TT_SIZE] = [TTEntry {
+    key: 0,
+    depth: 0,
+    score: 0,
+    flag: TTFlag::None,
+    best_move_sq: 255,
+}; TT_SIZE];
 
-// Hachage de Zobrist déterministe sans dépendances externes
 fn zobrist_hash(grid: &[u8; 100], to_move: u8) -> u64 {
     let mut h: u64 = if to_move == 1 { 0x9e3779b97f4a7c15 } else { 0xc6a4a7935bd1e995 };
     for (sq, &p_val) in grid.iter().enumerate() {
@@ -65,11 +70,11 @@ pub struct SimMove {
 #[derive(Clone, Copy)]
 pub struct BoardState {
     pub pieces_sq: [u8; 16],
-    pub pieces_kind: [u8; 16],  // 0: Exp, 1: Vang, 2: Sent
-    pub pieces_owner: [u8; 16], // 1: Rouge, 2: Bleu
+    pub pieces_kind: [u8; 16],
+    pub pieces_owner: [u8; 16],
     pub pieces_alive: [bool; 16],
     pub piece_count: usize,
-    pub grid: [u8; 100], // index pièce ou 255
+    pub grid: [u8; 100],
     pub heights: [u8; 100],
     pub to_move: u8,
     pub sentinel_exited: [bool; 3],
@@ -223,7 +228,6 @@ impl BoardState {
         }
 
         let mut score = 0;
-        let mut my_sent_y = -1;
         let mut opp_sent_x = -1;
         let mut opp_sent_y = -1;
 
@@ -241,13 +245,10 @@ impl BoardState {
             let kind = self.pieces_kind[i];
             let piece_val = match kind {
                 2 => {
-                    if self.pieces_owner[i] == side {
-                        my_sent_y = fwd;
-                    } else {
+                    if self.pieces_owner[i] != side {
                         opp_sent_x = x;
                         opp_sent_y = fwd;
                     }
-                    // Course agressive : chaque case gagnée vers la sortie vaut de plus en plus
                     fwd * 1_200 + h * 80 + 3_000
                 }
                 1 => fwd * 90 + h * 40 + 800,
@@ -261,7 +262,6 @@ impl BoardState {
             }
         }
 
-        // Si la Sentinelle adverse avance, bonus majeur pour les pièces qui bloquent sa colonne
         if opp_sent_y >= 2 && opp_sent_x >= 0 {
             for i in 0..self.piece_count {
                 if self.pieces_alive[i] && self.pieces_owner[i] == side {
@@ -271,7 +271,7 @@ impl BoardState {
                     let pfwd = if side == 1 { py } else { 9 - py };
 
                     if px == opp_sent_x && pfwd > opp_sent_y {
-                        score += 600; // Présence d'un mur sur la trajectoire adverse
+                        score += 600;
                     }
                 }
             }
@@ -281,7 +281,6 @@ impl BoardState {
     }
 }
 
-// Tri des coups pour déclencher un élagage Alpha-Bêta immédiat
 fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8) {
     let slice = &mut moves[..count];
     slice.sort_unstable_by_key(|m| {
@@ -300,7 +299,6 @@ fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8) {
     });
 }
 
-// Algorithme Negamax Alpha-Bêta avec Table de Transposition
 fn negamax(
     board: &mut BoardState,
     depth: usize,
@@ -319,22 +317,22 @@ fn negamax(
     let mut tt_move_sq = 255;
 
     unsafe {
-        if let Some(entry) = TT[tt_idx] {
-            if entry.key == hash && entry.depth >= (depth as u8) {
-                match entry.flag {
-                    TTFlag::Exact => return entry.score,
-                    TTFlag::LowerBound => alpha = alpha.max(entry.score),
-                    TTFlag::UpperBound => {
-                        if entry.score <= alpha {
-                            return entry.score;
-                        }
+        let entry = &TT[tt_idx];
+        if entry.flag != TTFlag::None && entry.key == hash && entry.depth >= (depth as u8) {
+            match entry.flag {
+                TTFlag::Exact => return entry.score,
+                TTFlag::LowerBound => alpha = alpha.max(entry.score),
+                TTFlag::UpperBound => {
+                    if entry.score <= alpha {
+                        return entry.score;
                     }
                 }
-                if alpha >= beta {
-                    return entry.score;
-                }
-                tt_move_sq = entry.best_move_sq;
+                TTFlag::None => {}
             }
+            if alpha >= beta {
+                return entry.score;
+            }
+            tt_move_sq = entry.best_move_sq;
         }
     }
 
@@ -394,13 +392,13 @@ fn negamax(
             TTFlag::Exact
         };
 
-        TT[tt_idx] = Some(TTEntry {
+        TT[tt_idx] = TTEntry {
             key: hash,
             depth: depth as u8,
             score: max_eval,
             flag,
             best_move_sq: best_sq,
-        });
+        };
     }
 
     max_eval
@@ -415,7 +413,6 @@ fn choose(turn: &Turn) -> usize {
     let pieces = state.pieces();
     let my_side = state.to_move;
 
-    // 1. Victoire immédiate
     for (i, m) in turn.moves.iter().enumerate() {
         if m.kind == MoveKind::Exit {
             let p = m.piece as usize;
@@ -425,7 +422,6 @@ fn choose(turn: &Turn) -> usize {
         }
     }
 
-    // 2. Construction du plateau compact
     let mut board = BoardState {
         pieces_sq: [255; 16],
         pieces_kind: [0; 16],
@@ -452,7 +448,6 @@ fn choose(turn: &Turn) -> usize {
         }
     }
 
-    // Conversion des coups racine
     let mut root_moves: Vec<(usize, SimMove)> = turn
         .moves
         .iter()
@@ -478,7 +473,6 @@ fn choose(turn: &Turn) -> usize {
         })
         .collect();
 
-    // Tri préliminaire à la racine
     root_moves.sort_by_key(|(_, m)| {
         let mut p = 0;
         if m.kind == SimMoveKind::Exit { p += 100_000; }
@@ -488,7 +482,6 @@ fn choose(turn: &Turn) -> usize {
 
     let mut best_move_idx = root_moves[0].0;
 
-    // Iterative Deepening jusqu'à MAX_DEPTH en consommant le fuel alloué
     for depth in 1..=MAX_DEPTH {
         if fuel_left() < SAFETY_FUEL {
             break;
