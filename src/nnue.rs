@@ -1,3 +1,5 @@
+use core::fmt;
+
 pub const FEATURE_COUNT: usize = 600; // 100 cases * 3 types de pièces * 2 camps
 pub const ACCUMULATOR_SIZE: usize = 128; // 128 neurones cachés en i16
 pub const OUTPUT_SCALE: i32 = 16;
@@ -5,6 +7,12 @@ pub const OUTPUT_SCALE: i32 = 16;
 #[derive(Clone, Copy)]
 pub struct Accumulator {
     pub vals: [i16; ACCUMULATOR_SIZE],
+}
+
+impl fmt::Debug for Accumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Accumulator({:?})", &self.vals[..8])
+    }
 }
 
 impl Accumulator {
@@ -44,7 +52,6 @@ impl Accumulator {
     ) -> i32 {
         let mut sum: i32 = output_bias;
         for i in 0..ACCUMULATOR_SIZE {
-            // Clipped ReLU
             let activated = self.vals[i].clamp(0, 127) as i32;
             sum += activated * (output_weights[i] as i32);
         }
