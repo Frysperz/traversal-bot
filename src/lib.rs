@@ -80,6 +80,51 @@ pub struct BoardState {
     pub sentinel_exited: [bool; 3],
 }
 
+fn quiescence(
+    board: &mut BoardState,
+    mut alpha: i32,
+    beta: i32,
+    aborted: &mut bool,
+) -> i32 {
+    if fuel_left() < SAFETY_FUEL {
+        *aborted = true;
+        return 0;
+    }
+
+    let stand_pat = board.evaluate(board.to_move);
+    if stand_pat >= beta {
+        return beta;
+    }
+    alpha = alpha.max(stand_pat);
+
+    // Génère seulement les captures
+    let mut captures = [SimMove::default(); 64];
+    let cap_count = board.generate_captures(&mut captures);
+
+    // Trie les captures (MVV/LVA: Most Valuable Victim / Least Valuable Attacker)
+    order_captures(&mut captures, cap_count);
+
+    for i in 0..cap_count {
+        let m = captures[i];
+        let (prev_sq, captured, exited) = board.apply(m);
+
+        let score = -quiescence(board, -beta, -alpha, aborted);
+
+        board.unmake(m, prev_sq, captured, exited);
+
+        if *aborted {
+            return 0;
+        }
+
+        if score >= beta {
+            return beta;
+        }
+        alpha = alpha.max(score);
+    }
+
+    alpha
+}
+
 impl BoardState {
     #[inline(always)]
     fn apply(&mut self, m: SimMove) -> (u8, u8, bool) {
@@ -332,6 +377,81 @@ impl BoardState {
             }
         }
         count
+    }
+
+    fn generate_captures(&self, buffer: &mut [SimMove; 64]) -> usize {
+        let mut count = 0;
+        let opp = if self.to_move == 1 { 2 } else { 1 };
+    
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != self.to_move {
+                continue;
+            }
+    
+            let sq = self.pieces_sq[i] as usize;
+            let x = (sq % 10) as i32;
+            let y = (sq / 10) as i32;
+            let ch = self.heights[sq] as i32;
+    
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let nx = x + dx;
+                let ny = y + dy;
+    
+                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                    let nsq = (ny * 10 + nx) as usize;
+                    let target = self.grid[nsq];
+                    if target != 255 && self.pieces_owner[target as usize] == opp {
+                        let att_str = match self.pieces_kind[i] {
+                            2 => 3,
+                            1 => 2,
+                            _ => 1,
+                        } + if ch > self.heights[nsq] as i32 { 1 } else { 0 };
+    
+                        let def_str = match self.pieces_kind[target as usize] {
+                            2 => 3,
+                            1 => 2,
+                            _ => 1,
+                        } + if self.heights[nsq] as i32 > ch { 1 } else { 0 };
+    
+                        if att_str >= def_str && count < 64 {
+                            buffer[count] = SimMove {
+                                piece_idx: i as u8,
+                                from: sq as u8,
+                                to: nsq as u8,
+                                kind: SimMoveKind::Attack,
+                                cost: 2,
+                                captured_idx: target,
+                            };
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+    
+    fn order_captures(moves: &mut [SimMove; 64], count: usize) {
+        moves[..count].sort_unstable_by(|a, b| {
+            // MVV/LVA: Priorité aux captures de pièces fortes avec des pièces faibles
+            let a_val = match a.captured_idx {
+                255 => 0,
+                idx => match moves[idx as usize].kind {
+                    2 => 3,
+                    1 => 2,
+                    _ => 1,
+                },
+            };
+            let b_val = match b.captured_idx {
+                255 => 0,
+                idx => match moves[idx as usize].kind {
+                    2 => 3,
+                    1 => 2,
+                    _ => 1,
+                },
+            };
+            b_val.cmp(&a_val)
+        });
     }
 }
 
