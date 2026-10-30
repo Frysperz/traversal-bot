@@ -1,5 +1,5 @@
-mod engine;
-mod nnue;
+pub mod engine;
+pub mod nnue;
 
 use engine::{
     FastBoard, FastMove, FastMoveKind, FEATURE_WEIGHTS, MAX_MOVES, NO_PIECE, OUTPUT_BIAS,
@@ -11,7 +11,6 @@ use traversal_bot::{bot, fuel_left, Turn};
 const SAFETY_FUEL: u64 = 60_000_000;
 const SENTINEL_WIN_SCORE: i32 = 1_000_000;
 
-/// Calibre les poids NNUE intégrés dans le binaire WebAssembly
 fn init_weights_if_needed() {
     static mut INITIALIZED: bool = false;
     unsafe {
@@ -22,13 +21,11 @@ fn init_weights_if_needed() {
         for sq in 0..100 {
             let y = (sq / 10) as i32;
 
-            // Poids pour la Sentinelle Rouge (Camp 1, avance vers y=9)
             let f_sent_red = (sq * 6) + 4;
             for i in 0..engine::MAX_MOVES.min(nnue::ACCUMULATOR_SIZE) {
                 FEATURE_WEIGHTS[f_sent_red][i] = (y * 12) as i16;
             }
 
-            // Poids pour la Sentinelle Bleue (Camp 2, avance vers y=0)
             let f_sent_blue = (sq * 6) + 5;
             for i in 0..engine::MAX_MOVES.min(nnue::ACCUMULATOR_SIZE) {
                 FEATURE_WEIGHTS[f_sent_blue][i] = ((9 - y) * 12) as i16;
@@ -73,7 +70,6 @@ fn build_fast_board(turn: &Turn) -> FastBoard {
     board
 }
 
-/// Évalue un état terminal ou une feuille de l'arbre via l'accumulateur NNUE
 fn evaluate_node(board: &FastBoard, my_side: u8) -> i32 {
     let opp_side = if my_side == 1 { 2 } else { 1 };
 
@@ -88,7 +84,6 @@ fn evaluate_node(board: &FastBoard, my_side: u8) -> i32 {
         board.acc.evaluate_output(&OUTPUT_WEIGHTS, OUTPUT_BIAS, my_side == 1)
     };
 
-    // Complément heuristique de terrain (prise de hauteur et sécurité)
     let mut height_bonus = 0;
     for i in 0..board.piece_count {
         let p = &board.pieces[i];
@@ -114,7 +109,6 @@ fn choose(turn: &Turn) -> usize {
 
     let my_side = turn.state.to_move;
 
-    // Condition prioritaire : Sortie immédiate de notre Sentinelle
     for (i, m) in turn.moves.iter().enumerate() {
         if m.kind == MoveKind::Exit {
             let p_idx = m.piece as usize;
@@ -157,7 +151,6 @@ fn choose(turn: &Turn) -> usize {
 
         let undo = board.apply_move(fast_move);
 
-        // Minimax d=2 avec génération des coups adverses et NNUE
         let mut opp_moves = [FastMove {
             piece_idx: 0,
             from: 0,
