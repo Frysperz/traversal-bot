@@ -11,7 +11,7 @@ traversal-bot = { git = "https://github.com/Sylv-Lej/traversal-rust-sdk", tag = 
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
