@@ -1,106 +1,77 @@
-mod nnue_weights;
+mod engine;
 
+use engine::{FastBoard, FastMove, FastMoveKind, MAX_MOVES, NO_PIECE};
 use traversal_bot::core::MoveKind;
-use traversal_bot::{bot, fuel_left, Turn};
-use nnue_weights::{ACCUMULATOR_SIZE, FEATURE_WEIGHTS, OUTPUT_BIAS, OUTPUT_WEIGHTS};
+use traversal_bot::{bot, Turn};
 
-const SAFETY_FUEL: u64 = 60_000_000;
-const INF: i32 = 2_000_000;
-const SENTINEL_EXIT_WIN: i32 = 1_000_000;
-
-#[derive(Clone, Copy)]
-pub struct Accumulator {
-    pub vals: [i16; ACCUMULATOR_SIZE],
-}
-
-impl Accumulator {
-    pub fn new() -> Self {
-        Self { vals: [0i16; ACCUMULATOR_SIZE] }
-    }
-
-    /// Mise à jour incrémentale NNUE (Ajout / Retrait de caractéristique en O(1))
-    #[inline(always)]
-    pub fn add_feature(&mut self, feature_idx: usize) {
-        if feature_idx < nnue_weights::FEATURE_COUNT {
-            let weights = &FEATURE_WEIGHTS[feature_idx];
-            for i in 0..ACCUMULATOR_SIZE {
-                self.vals[i] = self.vals[i].saturating_add(weights[i]);
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn sub_feature(&mut self, feature_idx: usize) {
-        if feature_idx < nnue_weights::FEATURE_COUNT {
-            let weights = &FEATURE_WEIGHTS[feature_idx];
-            for i in 0..ACCUMULATOR_SIZE {
-                self.vals[i] = self.vals[i].saturating_sub(weights[i]);
-            }
-        }
-    }
-
-    /// Évaluation rapide via la couche de sortie quantifiée + activation Clipped ReLU
-    #[inline(always)]
-    pub fn evaluate_output(&self, perspective_is_side1: bool) -> i32 {
-        let mut sum: i32 = OUTPUT_BIAS;
-        for i in 0..ACCUMULATOR_SIZE {
-            // Clipped ReLU (0..127)
-            let val = self.vals[i].clamp(0, 127) as i32;
-            sum += val * (OUTPUT_WEIGHTS[i] as i32);
-        }
-        if perspective_is_side1 { sum } else { -sum }
-    }
-}
-
-/// Convertit une pièce sur une case donnée en index de feature binaire
-#[inline(always)]
-fn get_feature_index(sq: u8, kind: u8, owner: u8) -> usize {
-    let side_offset = if owner == 1 { 0 } else { 1 };
-    let piece_offset = (kind as usize).min(2) * 2 + side_offset;
-    (sq as usize) * 6 + piece_offset
-}
-
-/// Évaluation statique combinée (NNUE + Heuristique de course et blocage)
-fn evaluate_position(turn: &Turn, acc: &Accumulator, my_side: u8) -> i32 {
-    let nnue_score = acc.evaluate_output(my_side == 1);
+/// Convertit l'état du SDK en structure de simulation rapide FastBoard
+fn build_fast_board(turn: &Turn) -> FastBoard {
+    let mut board = FastBoard::new();
     let state = &turn.state;
+
+    // Relief
+    for (i, &h) in state.heights.iter().enumerate().take(100) {
+        board.heights[i] = h;
+    }
+
+    // Pièces
     let pieces = state.pieces();
+    board.piece_count = pieces.len().min(engine::MAX_PIECES);
+
+    for (i, p) in pieces.iter().enumerate().take(board.piece_count) {
+        board.pieces[i] = engine::FastPiece {
+            sq: p.sq,
+            kind: p.kind as u8,
+            owner: p.owner,
+            alive: p.sq != 255,
+        };
+
+        if p.sq != 255 && (p.sq as usize) < 100 {
+            board.grid[p.sq as usize] = i as u8;
+        }
+    }
+
+    board.to_move = state.to_move;
+    board
+}
+
+/// Évalue statiquement l'état du simulateur
+fn evaluate_board(board: &FastBoard, my_side: u8) -> i32 {
     let opp_side = if my_side == 1 { 2 } else { 1 };
 
-    let mut tactical_bonus: i32 = 0;
-
-    if let Some(my_sent) = pieces.iter().find(|p| p.owner == my_side && p.kind as u8 == 2) {
-        let y = (my_sent.sq / 10) as i32;
-        let progress = if my_side == 1 { y } else { 9 - y };
-        tactical_bonus += progress * 400;
+    if board.sentinel_exited[my_side as usize] {
+        return 1_000_000;
+    }
+    if board.sentinel_exited[opp_side as usize] {
+        return -1_000_000;
     }
 
-    if let Some(opp_sent) = pieces.iter().find(|p| p.owner == opp_side && p.kind as u8 == 2) {
-        let ey = (opp_sent.sq / 10) as i32;
-        let opp_progress = if opp_side == 1 { ey } else { 9 - ey };
-        // Malus sévère si la Sentinelle adverse approche de la ligne de sortie
-        if opp_progress >= 5 {
-            tactical_bonus -= opp_progress * 500;
+    let mut score: i32 = 0;
+
+    for i in 0..board.piece_count {
+        let p = &board.pieces[i];
+        if !p.alive {
+            continue;
         }
-    }
 
-    nnue_score + tactical_bonus
-}
+        let y = (p.sq / 10) as i32;
+        let progress = if p.owner == 1 { y } else { 9 - y };
+        let h = board.heights[p.sq as usize] as i32;
 
-/// Ordonnancement des coups pour provoquer des coupures Alpha-Bêta immédiates
-fn sort_moves(turn: &Turn, move_order: &mut [usize]) {
-    move_order.sort_unstable_by_key(|&idx| {
-        let m = &turn.moves[idx];
-        let mut priority: i32 = 0;
-        if m.kind == MoveKind::Exit {
-            priority += 500_000;
-        } else if m.kind == MoveKind::Attack {
-            priority += 50_000 + (m.attack as i32 - m.defense as i32) * 1_000;
+        let piece_val = match p.kind {
+            2 => 1000 + progress * 150 + h * 30, // Sentinel
+            1 => 300 + progress * 40 + h * 20,   // Vanguard
+            _ => 100 + progress * 20 + h * 10,   // Explorer
+        };
+
+        if p.owner == my_side {
+            score += piece_val;
         } else {
-            priority -= (m.cost as i32) * 20;
+            score -= piece_val;
         }
-        -priority
-    });
+    }
+
+    score
 }
 
 fn choose(turn: &Turn) -> usize {
@@ -108,84 +79,82 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    let state = &turn.state;
-    let pieces = state.pieces();
-    let my_side = state.to_move;
+    let my_side = turn.state.to_move;
 
-    // 1. Victoire immédiate par sortie de Sentinelle
+    // 1. Détection prioritaire : Sortie immédiate de notre Sentinelle
     for (i, m) in turn.moves.iter().enumerate() {
         if m.kind == MoveKind::Exit {
             let p_idx = m.piece as usize;
+            let pieces = turn.state.pieces();
             if p_idx < pieces.len() && pieces[p_idx].kind as u8 == 2 {
                 return i;
             }
         }
     }
 
-    // 2. Initialisation de l'accumulateur NNUE pour la position racine
-    let mut root_acc = Accumulator::new();
-    for p in pieces.iter() {
-        if p.sq != 255 {
-            let f_idx = get_feature_index(p.sq, p.kind as u8, p.owner);
-            root_acc.add_feature(f_idx);
-        }
-    }
+    let mut board = build_fast_board(turn);
+    let mut best_idx = 0;
+    let mut best_score = i32::MIN;
 
-    let mut move_order: Vec<usize> = (0..turn.moves.len()).collect();
-    sort_moves(turn, &mut move_order);
+    // 2. Exploration avec simulation du coup racine
+    for (i, m) in turn.moves.iter().enumerate() {
+        let fast_kind = match m.kind {
+            MoveKind::Exit => FastMoveKind::Exit,
+            MoveKind::Attack => FastMoveKind::Attack,
+            _ => FastMoveKind::Move,
+        };
 
-    let mut best_idx = move_order[0];
-    let mut best_score = -INF;
-    let mut alpha = -INF;
-    let beta = INF;
+        let cap_idx = if m.to != 255 {
+            board.grid[m.to as usize]
+        } else {
+            NO_PIECE
+        };
 
-    // 3. Recherche Alpha-Bêta à profondeur 2 avec mises à jour incrémentales
-    for &idx in &move_order {
-        if fuel_left() < SAFETY_FUEL {
-            break;
-        }
+        let fast_move = FastMove {
+            piece_idx: m.piece,
+            from: turn.state.pieces()[m.piece as usize].sq,
+            to: m.to,
+            kind: fast_kind,
+            cost: m.cost,
+            captured_piece_idx: cap_idx,
+        };
 
-        let m = &turn.moves[idx];
-        let mut move_acc = root_acc;
-        let p_idx = m.piece as usize;
+        // Appliquer le coup dans le simulateur
+        let undo = board.apply_move(fast_move);
 
-        // Mise à jour incrémentale NNUE du coup allié
-        if p_idx < pieces.len() {
-            let old_sq = pieces[p_idx].sq;
-            let kind = pieces[p_idx].kind as u8;
-            let owner = pieces[p_idx].owner;
+        // Simulation de la meilleure riposte adverse (profondeur 2)
+        let mut opp_moves = [FastMove {
+            piece_idx: 0,
+            from: 0,
+            to: 0,
+            kind: FastMoveKind::Move,
+            cost: 0,
+            captured_piece_idx: NO_PIECE,
+        }; MAX_MOVES];
 
-            if old_sq != 255 {
-                move_acc.sub_feature(get_feature_index(old_sq, kind, owner));
-            }
+        let opp_move_count = board.generate_moves(&mut opp_moves);
+        let mut min_opp_score = i32::MAX;
 
-            if m.to != 255 {
-                // Si une pièce adverse occupait la case d'arrivée, on la retire de l'accumulateur
-                for opp_p in pieces.iter().filter(|p| p.owner != my_side && p.sq == m.to) {
-                    move_acc.sub_feature(get_feature_index(opp_p.sq, opp_p.kind as u8, opp_p.owner));
-                    break;
+        if opp_move_count == 0 {
+            min_opp_score = evaluate_board(&board, my_side);
+        } else {
+            for j in 0..opp_move_count {
+                let opp_undo = board.apply_move(opp_moves[j]);
+                let score = evaluate_board(&board, my_side);
+                board.unmake_move(opp_undo);
+
+                if score < min_opp_score {
+                    min_opp_score = score;
                 }
-                move_acc.add_feature(get_feature_index(m.to, kind, owner));
             }
         }
 
-        let mut node_score = evaluate_position(turn, &move_acc, my_side);
+        // Annuler le coup racine
+        board.unmake_move(undo);
 
-        if m.kind == MoveKind::Exit {
-            node_score += 20_000;
-        }
-
-        // Élagage Alpha-Bêta
-        if node_score > best_score {
-            best_score = node_score;
-            best_idx = idx;
-        }
-
-        if node_score > alpha {
-            alpha = node_score;
-        }
-        if alpha >= beta {
-            break; // Coupure Beta
+        if min_opp_score > best_score {
+            best_score = min_opp_score;
+            best_idx = i;
         }
     }
 
