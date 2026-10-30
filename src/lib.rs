@@ -1,32 +1,14 @@
 pub mod engine;
 pub mod nnue;
 
-#[allow(dead_code)]
-#[path = "nnue_weights.rs"]
-mod nnue_weights;
-
 use engine::{FastBoard, FastMove, FastMoveKind, MAX_MOVES, NO_PIECE};
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
 
 const SAFETY_FUEL: u64 = 75_000_000;
 const INF: i32 = 2_000_000;
-const SENTINEL_WIN_SCORE: i32 = 1_000_000;
-const MAX_DEPTH: usize = 12;
-
-/// Injection des poids entraînés dans le moteur au démarrage
-fn setup_trained_weights() {
-    static mut DONE: bool = false;
-    unsafe {
-        if DONE {
-            return;
-        }
-        engine::FEATURE_WEIGHTS = nnue_weights::TRAINED_FEATURE_WEIGHTS;
-        engine::OUTPUT_WEIGHTS = nnue_weights::TRAINED_OUTPUT_WEIGHTS;
-        engine::OUTPUT_BIAS = nnue_weights::TRAINED_OUTPUT_BIAS;
-        DONE = true;
-    }
-}
+const SENTINEL_WIN: i32 = 1_000_000;
+const MAX_DEPTH: usize = 8;
 
 fn build_fast_board(turn: &Turn) -> FastBoard {
     let mut board = FastBoard::new();
@@ -57,28 +39,22 @@ fn build_fast_board(turn: &Turn) -> FastBoard {
     board
 }
 
-/// Évaluation statique combinée (NNUE + bonus tactiques de relief et progression)
+/// Évaluation géométrique grand-maître conçue pour écraser Sommet
 #[inline(always)]
-fn evaluate(board: &FastBoard, perspective_side: u8) -> i32 {
+fn evaluate_expert(board: &FastBoard, perspective_side: u8) -> i32 {
     let opp_side = if perspective_side == 1 { 2 } else { 1 };
 
     if board.sentinel_exited[perspective_side as usize] {
-        return SENTINEL_WIN_SCORE;
+        return SENTINEL_WIN;
     }
     if board.sentinel_exited[opp_side as usize] {
-        return -SENTINEL_WIN_SCORE;
+        return -SENTINEL_WIN;
     }
 
-    let nnue_val = unsafe {
-        board.acc.evaluate_output(
-            &engine::OUTPUT_WEIGHTS,
-            engine::OUTPUT_BIAS,
-            perspective_side == 1,
-        )
-    };
+    let mut score = 0;
+    let mut my_sent_sq = 255;
+    let mut opp_sent_sq = 255;
 
-    // Bonus de crête et progression de Sentinelle
-    let mut positional = 0;
     for i in 0..board.piece_count {
         let p = &board.pieces[i];
         if !p.alive || p.sq == 255 {
@@ -86,56 +62,91 @@ fn evaluate(board: &FastBoard, perspective_side: u8) -> i32 {
         }
 
         let sq = p.sq as usize;
+        let x = (sq % 10) as i32;
         let y = (sq / 10) as i32;
-        let progress = if p.owner == 1 { y } else { 9 - y };
+        let forward = if p.owner == 1 { y } else { 9 - y };
         let h = board.heights[sq] as i32;
 
-        let piece_score = match p.kind {
-            2 => progress * 150 + h * 25,
-            1 => progress * 50 + h * 15,
-            _ => progress * 20 + h * 8,
-        };
-
-        if p.owner == perspective_side {
-            positional += piece_score;
+        if p.kind == 2 {
+            // Sentinelle : objectif course absolue
+            if p.owner == perspective_side {
+                my_sent_sq = p.sq;
+                score += forward * 600 + h * 40;
+                // Si la ligne d'arrivée est proche
+                if forward >= 7 {
+                    score += forward * 800;
+                }
+            } else {
+                opp_sent_sq = p.sq;
+                score -= forward * 600 + h * 40;
+                if forward >= 7 {
+                    score -= forward * 800;
+                }
+            }
+        } else if p.kind == 1 {
+            // Avant-garde : soutien et prise de hauteur
+            let val = forward * 40 + h * 25 + 200;
+            if p.owner == perspective_side {
+                score += val;
+            } else {
+                score -= val;
+            }
         } else {
-            positional -= piece_score;
+            // Explorateur
+            let val = forward * 15 + h * 10 + 80;
+            if p.owner == perspective_side {
+                score += val;
+            } else {
+                score -= val;
+            }
         }
     }
 
-    nnue_val + positional
+    // Blocus de la Sentinelle adverse par nos Avant-gardes / Explorateurs
+    if opp_sent_sq != 255 {
+        let ox = (opp_sent_sq % 10) as i32;
+        let oy = (opp_sent_sq / 10) as i32;
+
+        for i in 0..board.piece_count {
+            let p = &board.pieces[i];
+            if p.alive && p.owner == perspective_side && p.sq != 255 {
+                let px = (p.sq % 10) as i32;
+                let py = (p.sq / 10) as i32;
+
+                // Si notre pièce se place sur la même colonne et bloque la course ennemie
+                if px == ox {
+                    let is_in_front = if opp_side == 1 { py > oy } else { py < oy };
+                    if is_in_front {
+                        score += 350;
+                    }
+                }
+            }
+        }
+    }
+
+    score
 }
 
-/// Ordonnancement des coups (Move Ordering) pour maximiser les coupures bêta
-fn sort_moves(moves: &mut [FastMove], count: usize, killer: Option<FastMove>) {
+fn sort_moves(moves: &mut [FastMove], count: usize) {
     let slice = &mut moves[..count];
     slice.sort_unstable_by_key(|m| {
         let mut priority = 0;
-
         if m.kind == FastMoveKind::Exit {
-            priority += 200_000;
+            priority += 500_000;
         } else if m.kind == FastMoveKind::Attack {
-            priority += 50_000;
+            priority += 80_000;
+        } else {
+            priority -= (m.cost as i32) * 20;
         }
-
-        if let Some(k) = killer {
-            if m.from == k.from && m.to == k.to && m.kind == k.kind {
-                priority += 30_000;
-            }
-        }
-
         -priority
     });
 }
 
-/// Moteur Alpha-Bêta récursif (Negamax)
 fn alpha_beta(
     board: &mut FastBoard,
     depth: usize,
     mut alpha: i32,
     beta: i32,
-    my_side: u8,
-    killers: &mut [Option<FastMove>; MAX_DEPTH],
     aborted: &mut bool,
 ) -> i32 {
     if fuel_left() < SAFETY_FUEL {
@@ -144,7 +155,7 @@ fn alpha_beta(
     }
 
     if board.sentinel_exited[1] || board.sentinel_exited[2] || depth == 0 {
-        return evaluate(board, board.to_move);
+        return evaluate_expert(board, board.to_move);
     }
 
     let mut move_buffer = [FastMove {
@@ -158,10 +169,10 @@ fn alpha_beta(
 
     let count = board.generate_moves(&mut move_buffer);
     if count == 0 {
-        return -SENTINEL_WIN_SCORE + 100;
+        return -SENTINEL_WIN + 50;
     }
 
-    sort_moves(&mut move_buffer, count, killers[depth]);
+    sort_moves(&mut move_buffer, count);
 
     let mut max_eval = -INF;
 
@@ -169,7 +180,7 @@ fn alpha_beta(
         let m = move_buffer[i];
         let undo = board.apply_move(m);
 
-        let eval = -alpha_beta(board, depth - 1, -beta, -alpha, my_side, killers, aborted);
+        let eval = -alpha_beta(board, depth - 1, -beta, -alpha, aborted);
 
         board.unmake_move(undo);
 
@@ -180,16 +191,10 @@ fn alpha_beta(
         if eval > max_eval {
             max_eval = eval;
         }
-
         if eval > alpha {
             alpha = eval;
         }
-
-        // Coupure Bêta
         if alpha >= beta {
-            if m.kind != FastMoveKind::Exit {
-                killers[depth] = Some(m);
-            }
             break;
         }
     }
@@ -202,15 +207,13 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    setup_trained_weights();
-
     let my_side = turn.state.to_move;
+    let pieces = turn.state.pieces();
 
-    // Détection de victoire instantanée (racine)
+    // 1. Priorité absolue : notre Sentinelle sort ce tour-ci
     for (i, m) in turn.moves.iter().enumerate() {
         if m.kind == MoveKind::Exit {
             let p_idx = m.piece as usize;
-            let pieces = turn.state.pieces();
             if p_idx < pieces.len() && pieces[p_idx].kind as u8 == 2 {
                 return i;
             }
@@ -219,7 +222,6 @@ fn choose(turn: &Turn) -> usize {
 
     let mut root_board = build_fast_board(turn);
 
-    // Conversion des coups SDK vers FastMove pour la racine
     let mut root_moves: Vec<(usize, FastMove)> = turn
         .moves
         .iter()
@@ -249,23 +251,33 @@ fn choose(turn: &Turn) -> usize {
         })
         .collect();
 
-    let mut best_overall_idx = 0;
-    let mut killers: [Option<FastMove>; MAX_DEPTH] = [None; MAX_DEPTH];
+    // Tri préliminaire des coups à la racine
+    root_moves.sort_by_key(|(_, m)| {
+        let mut p = 0;
+        if m.kind == FastMoveKind::Exit {
+            p += 100_000;
+        } else if m.kind == FastMoveKind::Attack {
+            p += 20_000;
+        }
+        -p
+    });
 
-    // Approfondissement itératif (Iterative Deepening) : d = 1 jusqu'à MAX_DEPTH
+    let mut best_idx = root_moves[0].0;
+
+    // Iterative Deepening de d=1 à d=MAX_DEPTH
     for current_depth in 1..=MAX_DEPTH {
         if fuel_left() < SAFETY_FUEL {
             break;
         }
 
-        let mut depth_best_idx = root_moves[0].0;
+        let mut depth_best = root_moves[0].0;
         let mut alpha = -INF;
         let beta = INF;
-        let mut depth_aborted = false;
+        let mut aborted = false;
 
         for &(orig_idx, fast_m) in &root_moves {
             if fuel_left() < SAFETY_FUEL {
-                depth_aborted = true;
+                aborted = true;
                 break;
             }
 
@@ -276,32 +288,29 @@ fn choose(turn: &Turn) -> usize {
                 current_depth - 1,
                 -beta,
                 -alpha,
-                my_side,
-                &mut killers,
-                &mut depth_aborted,
+                &mut aborted,
             );
 
             root_board.unmake_move(undo);
 
-            if depth_aborted {
+            if aborted {
                 break;
             }
 
             if score > alpha {
                 alpha = score;
-                depth_best_idx = orig_idx;
+                depth_best = orig_idx;
             }
         }
 
-        // On ne valide le coup que si toute la profondeur a été explorée sans épuiser le fuel
-        if !depth_aborted {
-            best_overall_idx = depth_best_idx;
+        if !aborted {
+            best_idx = depth_best;
         } else {
             break;
         }
     }
 
-    best_overall_idx
+    best_idx
 }
 
 bot!(choose);
