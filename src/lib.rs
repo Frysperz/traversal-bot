@@ -258,6 +258,57 @@ impl BoardState {
                     }
                 }
             }
+            // Dans BoardState::generate_moves():
+// Ajoute après les mouvements normaux:
+
+// --- RÈGLES SPÉCIALES ---
+if self.pieces_kind[i] == 0 {  // Explorer
+    let sq = self.pieces_sq[i] as usize;
+    let x = (sq % 10) as i32;
+    let y = (sq / 10) as i32;
+
+    // Diagonale (1 case)
+    for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+        let nx = x + dx;
+        let ny = y + dy;
+        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+            let nsq = (ny * 10 + nx) as usize;
+            if self.grid[nsq] == 255 && count < 64 {
+                buffer[count] = SimMove {
+                    piece_idx: i as u8,
+                    from: sq as u8,
+                    to: nsq as u8,
+                    kind: SimMoveKind::Move,
+                    cost: 1, // Coût fixe pour diagonal
+                    captured_idx: 255,
+                };
+                count += 1;
+            }
+        }
+    }
+
+    // Leap (2 cases orthogonales)
+    for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
+        let nx = x + dx;
+        let ny = y + dy;
+        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+            let nsq = (ny * 10 + nx) as usize;
+            if self.grid[nsq] == 255 && count < 64 {
+                buffer[count] = SimMove {
+                    piece_idx: i as u8,
+                    from: sq as u8,
+                    to: nsq as u8,
+                    kind: SimMoveKind::Move,
+                    cost: 1, // Coût fixe pour leap
+                    captured_idx: 255,
+                };
+                count += 1;
+            }
+        }
+    }
+}
+
+// Vanguard: Bonus +1 si mouvement = 4 cases (à gérer dans l'évaluation des attaques)
         }
         count
     }
@@ -579,6 +630,34 @@ fn negamax(
 }
 
 fn choose(turn: &Turn) -> usize {
+    if turn.moves.is_empty() {
+        return 0;
+    }
+
+    // Si fuel très bas, retourne un move Exit ou Attack rapidement
+    if fuel_left() < 50_000_000 {
+        for (i, m) in turn.moves.iter().enumerate() {
+            if m.kind == MoveKind::Exit {
+                return i;
+            }
+        }
+        for (i, m) in turn.moves.iter().enumerate() {
+            if m.kind == MoveKind::Attack {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    // Sinon, lance Negamax avec profondeur adaptative
+    let max_depth = if fuel_left() > 1_000_000_000 {
+        12
+    } else if fuel_left() > 500_000_000 {
+        10
+    } else {
+        8
+    };
+    
     if turn.moves.is_empty() {
         return 0;
     }
