@@ -1,63 +1,20 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
+use rand::Rng;
+use rand_chacha::ChaCha8Rng;
 
-const SAFETY_FUEL: u64 = 150_000_000;
-const INF: i32 = 2_000_000;
-const SENTINEL_WIN: i32 = 1_000_000;
-const MAX_DEPTH: usize = 14;
+const SAFETY_FUEL: u64 = 50_000_000;
+const MAX_ITERATIONS: usize = 1500;
+const SENTINEL_WIN_SCORE: f32 = 10_000.0;
 
-const TT_SIZE: usize = 1 << 14;
-const TT_MASK: usize = TT_SIZE - 1;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TTFlag {
-    None,
-    Exact,
-    LowerBound,
-    UpperBound,
-}
-
-#[derive(Clone, Copy)]
-struct TTEntry {
-    key: u64,
-    depth: u8,
-    score: i32,
-    flag: TTFlag,
-    best_move_sq: u8,
-}
-
-static mut TT: [TTEntry; TT_SIZE] = [TTEntry {
-    key: 0,
-    depth: 0,
-    score: 0,
-    flag: TTFlag::None,
-    best_move_sq: 255,
-}; TT_SIZE];
-
-fn zobrist_hash(grid: &[u8; 100], to_move: u8) -> u64 {
-    let mut h: u64 = if to_move == 1 { 0x9e3779b97f4a7c15 } else { 0xc6a4a7935bd1e995 };
-    for (sq, &p_val) in grid.iter().enumerate() {
-        if p_val != 255 {
-            let mut val = (sq as u64) ^ ((p_val as u64) << 8);
-            val = val.wrapping_mul(0xbf58476d1ce4e5b9);
-            val ^= val >> 30;
-            val = val.wrapping_mul(0x94d049bb133111eb);
-            val ^= val >> 27;
-            h ^= val;
-        }
-    }
-    h
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimMoveKind {
-    #[default]
     Move,
     Attack,
     Exit,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SimMove {
     pub piece_idx: u8,
     pub from: u8,
@@ -65,6 +22,19 @@ pub struct SimMove {
     pub kind: SimMoveKind,
     pub cost: u8,
     pub captured_idx: u8,
+}
+
+impl Default for SimMove {
+    fn default() -> Self {
+        SimMove {
+            piece_idx: 0,
+            from: 0,
+            to: 0,
+            kind: SimMoveKind::Move,
+            cost: 0,
+            captured_idx: 255,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -81,7 +51,40 @@ pub struct BoardState {
 }
 
 impl BoardState {
-    #[inline(always)]
+    fn from_turn(turn: &Turn) -> Self {
+        let state = &turn.state;
+        let pieces = state.pieces();
+        let my_side = state.to_move;
+
+        let mut board = Self {
+            pieces_sq: [255; 16],
+            pieces_kind: [0; 16],
+            pieces_owner: [0; 16],
+            pieces_alive: [false; 16],
+            piece_count: pieces.len().min(16),
+            grid: [255; 100],
+            heights: [0; 100],
+            to_move: my_side,
+            sentinel_exited: [false; 3],
+        };
+
+        for (i, &h) in state.heights.iter().enumerate().take(100) {
+            board.heights[i] = h;
+        }
+
+        for (i, p) in pieces.iter().enumerate().take(board.piece_count) {
+            board.pieces_sq[i] = p.sq;
+            board.pieces_kind[i] = p.kind as u8;
+            board.pieces_owner[i] = p.owner;
+            board.pieces_alive[i] = p.sq != 255;
+            if p.sq != 255 && (p.sq as usize) < 100 {
+                board.grid[p.sq as usize] = i as u8;
+            }
+        }
+
+        board
+    }
+
     fn apply(&mut self, m: SimMove) -> (u8, u8, bool) {
         let p = m.piece_idx as usize;
         let prev_sq = self.pieces_sq[p];
@@ -120,7 +123,6 @@ impl BoardState {
         (prev_sq, captured, exited)
     }
 
-    #[inline(always)]
     fn unmake(&mut self, m: SimMove, prev_sq: u8, captured: u8, exited: bool) {
         self.to_move = if self.to_move == 1 { 2 } else { 1 };
         let p = m.piece_idx as usize;
@@ -215,7 +217,7 @@ impl BoardState {
                 }
             }
 
-            // Règles spéciales pour Explorer
+            // Explorer: diagonal et leap
             if kind == 0 {
                 for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
                     let nx = x + dx;
@@ -259,141 +261,154 @@ impl BoardState {
         count
     }
 
-    #[inline(always)]
-    fn evaluate(&self, side: u8) -> i32 {
-        let opp = 3 - side;
-
-        // 1. Vérifie victoire/défaite instantanée Sentinel
-        if self.sentinel_exited[side as usize] {
-            return 10_000_000; // Victoire instantanée
+    fn is_terminal(&self) -> (bool, f32) {
+        if self.sentinel_exited[1] {
+            return (true, 1.0);
         }
-        if self.sentinel_exited[opp as usize] {
-            return -10_000_000; // Défaite instantanée
+        if self.sentinel_exited[2] {
+            return (true, -1.0);
         }
 
-        let mut score: i32 = 0;
-
-        // 2. Bonus exponentiel pour Sentinels proches de la sortie
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_kind[i] != 2 { continue; }
-
-            let sq = self.pieces_sq[i] as usize;
-            let y = sq / 10;
-            let exit_row = if self.pieces_owner[i] == 1 { 9 } else { 0 };
-            let distance = (y as i32).abs_diff(exit_row as i32);
-
-            if self.pieces_owner[i] == side {
-                // NOUS: Bonus énorme si proche de la sortie
-                score += match distance {
-                    0 => 10_000_000,  // Sur la ligne de sortie
-                    1 => 8_000_000,    // À 1 case
-                    2 => 5_000_000,    // À 2 cases
-                    3 => 2_000_000,    // À 3 cases
-                    4 => 1_000_000,    // À 4 cases
-                    _ => 500_000,      // Plus loin
-                };
-            } else {
-                // ADVERSAIRE: Pénalité énorme si proche de la sortie
-                score -= match distance {
-                    0 => 15_000_000,  // Sur la ligne → PERDU si on ne bloque pas
-                    1 => 10_000_000,  // À 1 case → DANGER IMMÉDIAT
-                    2 => 6_000_000,   // À 2 cases
-                    3 => 3_000_000,   // À 3 cases
-                    4 => 1_500_000,   // À 4 cases
-                    _ => 500_000,     // Plus loin
-                };
-            }
+        let mut moves = [SimMove::default(); 64];
+        if self.generate_moves(&mut moves) == 0 {
+            return (true, 0.0);
         }
 
-        // 3. Vérifie si un Sentinel adverse est en position de victoire immédiate
-        if self.is_sentinel_threatened(opp) {
-            score -= 20_000_000; // URGENCE ABSOLUE: bloquer !
-        }
-
-        // 4. Évalue chaque pièce (autres que Sentinels)
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_kind[i] == 2 { continue; } // Sentinels déjà traités
-
-            let sq = self.pieces_sq[i] as usize;
-            let kind = self.pieces_kind[i];
-            let owner = self.pieces_owner[i];
-            let y = sq / 10;
-            let h = self.heights[sq] as i32;
-
-            let dist_to_exit: i32 = if owner == 1 {
-                9 - y as i32
-            } else {
-                y as i32
-            };
-
-            let base_value: i32 = match kind {
-                1 => 2_000, // Vanguard = 2 pts
-                _ => 1_000, // Explorer = 1 pt
-            };
-
-            let progress_bonus: i32 = dist_to_exit * match kind {
-                1 => 200,
-                _ => 100,
-            };
-
-            let height_bonus: i32 = h * 100;
-            let blocking_bonus: i32 = self.count_blocked_sentinels(i) as i32 * 1_000;
-            let mobility: i32 = self.count_legal_moves_for_piece(i) as i32 * 50;
-
-            let piece_score: i32 = base_value + progress_bonus + height_bonus + blocking_bonus + mobility;
-
-            if owner == side {
-                score += piece_score;
-            } else {
-                score -= piece_score;
-            }
-        }
-
-        // 5. Bonus de contrôle global des hauteurs
-        score += self.evaluate_height_control(side) * 30;
-
-        // 6. Pénalité si nos pièces sont isolées
-        score -= self.evaluate_isolation(side) * 200;
-
-        score
+        (false, 0.0)
     }
 
-    fn is_sentinel_threatened(&self, side: u8) -> bool {
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != side || self.pieces_kind[i] != 2 {
-                continue;
-            }
-            let sq = self.pieces_sq[i] as usize;
-            let y = sq / 10;
-            let exit_row = if side == 1 { 9 } else { 0 };
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
-            if (y as i32).abs_diff(exit_row as i32) <= 1 {
-                return true;
-            }
+#[derive(Clone)]
+struct MCTSNode {
+    visits: u32,
+    total_value: f32,
+    children: Vec<MCTSNode>,
+    untried_moves: Vec<usize>,
+    move_index: usize,
+}
+
+impl MCTSNode {
+    fn new() -> Self {
+        Self {
+            visits: 0,
+            total_value: 0.0,
+            children: Vec::new(),
+            untried_moves: Vec::new(),
+            move_index: 0,
         }
-        false
     }
 
-    fn blocks_sentinel_threat(&self, to_sq: u8, side: u8) -> bool {
+    fn uct_value(&self, exploration_weight: f32, parent_visits: u32) -> f32 {
+        if self.visits == 0 {
+            return f32::INFINITY;
+        }
+        let exploitation = self.total_value / self.visits as f32;
+        let exploration = exploration_weight * (2.0 * (parent_visits as f32).ln() / self.visits as f32).sqrt();
+        exploitation + exploration
+    }
+
+    fn best_child(&self) -> usize {
+        self.children.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.visits.cmp(&b.visits)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+}
+
+fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
+    let mut current_side = board.to_move;
+    let mut ply = 0;
+
+    loop {
+        ply += 1;
+        if ply > 150 {
+            return 0.0;
+        }
+
+        let (terminal, result) = board.is_terminal();
+        if terminal {
+            return result;
+        }
+
+        let mut moves = [SimMove::default(); 64];
+        let count = board.generate_moves(&mut moves);
+        if count == 0 {
+            return 0.0;
+        }
+
+        // Sélectionne un move avec priorité Sentinel
+        let mut scores = vec![0.0; count];
+        for i in 0..count {
+            let m = &moves[i];
+            if m.kind == SimMoveKind::Exit {
+                scores[i] = 10_000.0;
+                if board.pieces_kind[m.piece_idx as usize] == 2 {
+                    scores[i] += 100_000.0; // Sentinel = priorité absolue
+                }
+            } else if m.kind == SimMoveKind::Attack {
+                scores[i] = 1000.0;
+                if m.captured_idx != 255 && board.pieces_kind[m.captured_idx as usize] == 2 {
+                    scores[i] += 50_000.0; // Capture Sentinel
+                }
+            } else if m.to != 255 {
+                let y = (m.to / 10) as i32;
+                let target_y = if board.to_move == 1 { 9 } else { 0 };
+                scores[i] = (target_y - y).abs() as f32 * 100.0;
+                // Bonus si on bloque un Sentinel adverse
+                if board.blocks_sentinel(m.to) {
+                    scores[i] += 50_000.0;
+                }
+            }
+        }
+
+        // Sélectionne un move pondéré par les scores
+        let total: f32 = scores.iter().sum();
+        if total > 0.0 {
+            let r = rng.gen_range(0.0..total);
+            let mut sum = 0.0;
+            for (i, &s) in scores.iter().enumerate() {
+                sum += s;
+                if sum >= r {
+                    board.apply(moves[i]);
+                    current_side = 3 - current_side;
+                    break;
+                }
+            }
+        } else {
+            let i = rng.gen_range(0..count);
+            board.apply(moves[i]);
+            current_side = 3 - current_side;
+        }
+    }
+}
+
+impl BoardState {
+    fn blocks_sentinel(&self, to_sq: u8) -> bool {
         let to_sq = to_sq as usize;
         let to_x = to_sq % 10;
         let to_y = to_sq / 10;
+        let opp = 3 - self.to_move;
 
         for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != side || self.pieces_kind[i] != 2 {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
                 continue;
             }
             let sent_sq = self.pieces_sq[i] as usize;
             let sent_x = sent_sq % 10;
             let sent_y = sent_sq / 10;
-            let exit_row = if side == 1 { 9 } else { 0 };
+            let exit_row = if opp == 1 { 9 } else { 0 };
 
             if (sent_y as i32).abs_diff(exit_row as i32) == 1 {
-                // Vérifie si on se place juste devant ou sur le chemin
                 if (to_y as i32).abs_diff(sent_y as i32) <= 1 && (to_x as i32).abs_diff(sent_x as i32) <= 1 {
                     return true;
                 }
-                // Ou sur la ligne de sortie
                 if to_y == exit_row && to_x == sent_x {
                     return true;
                 }
@@ -401,401 +416,6 @@ impl BoardState {
         }
         false
     }
-
-    fn count_blocked_sentinels(&self, piece_idx: usize) -> i32 {
-        let mut count = 0;
-        let piece_sq = self.pieces_sq[piece_idx] as usize;
-        let piece_owner = self.pieces_owner[piece_idx];
-        let opp = 3 - piece_owner;
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
-                continue;
-            }
-            let sent_sq = self.pieces_sq[i] as usize;
-            if (piece_sq % 10).abs_diff(sent_sq % 10) <= 1 && (piece_sq / 10).abs_diff(sent_sq / 10) <= 1 {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    fn count_legal_moves_for_piece(&self, piece_idx: usize) -> usize {
-        let mut count = 0;
-        let sq = self.pieces_sq[piece_idx] as usize;
-        let x = (sq % 10) as i32;
-        let y = (sq / 10) as i32;
-        let ch = self.heights[sq] as i32;
-        let kind = self.pieces_kind[piece_idx];
-        let owner = self.pieces_owner[piece_idx];
-        let exit_row = if owner == 1 { 9 } else { 0 };
-
-        if y == exit_row {
-            count += 1;
-        }
-
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let nx = x + dx;
-            let ny = y + dy;
-            if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-                let nsq = (ny * 10 + nx) as usize;
-                if self.grid[nsq] == 255 {
-                    count += 1;
-                } else if self.pieces_owner[self.grid[nsq] as usize] != owner {
-                    let att_str = match kind { 2 => 3, 1 => 2, _ => 1 } + if ch > self.heights[nsq] as i32 { 1 } else { 0 };
-                    let def_str = match self.pieces_kind[self.grid[nsq] as usize] { 2 => 3, 1 => 2, _ => 1 } + if self.heights[nsq] as i32 > ch { 1 } else { 0 };
-                    if att_str >= def_str {
-                        count += 1;
-                    }
-                }
-            }
-        }
-
-        if kind == 0 {
-            for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                let nx = x + dx;
-                let ny = y + dy;
-                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 && self.grid[(ny * 10 + nx) as usize] == 255 {
-                    count += 1;
-                }
-            }
-            for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
-                let nx = x + dx;
-                let ny = y + dy;
-                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 && self.grid[(ny * 10 + nx) as usize] == 255 {
-                    count += 1;
-                }
-            }
-        }
-
-        count
-    }
-
-    fn evaluate_height_control(&self, side: u8) -> i32 {
-        let mut score = 0;
-        for sq in 0..100 {
-            let h = self.heights[sq] as i32;
-            if self.grid[sq] != 255 {
-                let piece_idx = self.grid[sq] as usize;
-                if self.pieces_owner[piece_idx] == side {
-                    score += h * 2;
-                } else {
-                    score -= h;
-                }
-            }
-        }
-        score
-    }
-
-    fn evaluate_isolation(&self, side: u8) -> i32 {
-        let mut isolation_penalty = 0;
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != side {
-                continue;
-            }
-            let sq = self.pieces_sq[i] as usize;
-            let x = sq % 10;
-            let y = sq / 10;
-            let mut has_ally_adjacent = false;
-
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
-                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-                    let nsq = (ny * 10 + nx) as usize;
-                    if self.grid[nsq] != 255 {
-                        let other_idx = self.grid[nsq] as usize;
-                        if self.pieces_owner[other_idx] == side {
-                            has_ally_adjacent = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !has_ally_adjacent {
-                isolation_penalty += 1;
-            }
-        }
-        isolation_penalty
-    }
-
-    fn generate_captures(&self, buffer: &mut [SimMove; 64]) -> usize {
-        let mut count = 0;
-        let opp = if self.to_move == 1 { 2 } else { 1 };
-
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != self.to_move {
-                continue;
-            }
-
-            let sq = self.pieces_sq[i] as usize;
-            let x = (sq % 10) as i32;
-            let y = (sq / 10) as i32;
-            let ch = self.heights[sq] as i32;
-            let kind = self.pieces_kind[i];
-
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let nx = x + dx;
-                let ny = y + dy;
-
-                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-                    let nsq = (ny * 10 + nx) as usize;
-                    let target = self.grid[nsq];
-                    if target != 255 && self.pieces_owner[target as usize] == opp {
-                        let att_str = match kind {
-                            2 => 3,
-                            1 => 2,
-                            _ => 1,
-                        } + if ch > self.heights[nsq] as i32 { 1 } else { 0 };
-
-                        let def_str = match self.pieces_kind[target as usize] {
-                            2 => 3,
-                            1 => 2,
-                            _ => 1,
-                        } + if self.heights[nsq] as i32 > ch { 1 } else { 0 };
-
-                        if att_str >= def_str && count < 64 {
-                            buffer[count] = SimMove {
-                                piece_idx: i as u8,
-                                from: sq as u8,
-                                to: nsq as u8,
-                                kind: SimMoveKind::Attack,
-                                cost: 2,
-                                captured_idx: target,
-                            };
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-        count
-    }
-
-    fn order_captures(&self, moves: &mut [SimMove; 64], count: usize) {
-        moves[..count].sort_unstable_by(|a, b| {
-            let a_val = if a.captured_idx != 255 {
-                match self.pieces_kind[a.captured_idx as usize] {
-                    2 => 3,
-                    1 => 2,
-                    _ => 1,
-                }
-            } else {
-                0
-            };
-            let b_val = if b.captured_idx != 255 {
-                match self.pieces_kind[b.captured_idx as usize] {
-                    2 => 3,
-                    1 => 2,
-                    _ => 1,
-                }
-            } else {
-                0
-            };
-            b_val.cmp(&a_val)
-        });
-    }
-}
-
-fn order_moves(moves: &mut [SimMove], count: usize, tt_move_sq: u8, board: &BoardState) {
-    moves[..count].sort_unstable_by(|a, b| {
-        let mut score_a = 0;
-        let mut score_b = 0;
-
-        // 1. TT move
-        if a.to == tt_move_sq && tt_move_sq != 255 { score_a += 10_000_000; }
-        if b.to == tt_move_sq && tt_move_sq != 255 { score_b += 10_000_000; }
-
-        // 2. SENTINEL EXIT = PRIORITÉ ABSOLUE
-        if a.kind == SimMoveKind::Exit && board.pieces_kind[a.piece_idx as usize] == 2 {
-            score_a += 100_000_000;
-        }
-        if b.kind == SimMoveKind::Exit && board.pieces_kind[b.piece_idx as usize] == 2 {
-            score_b += 100_000_000;
-        }
-
-        // 3. BLOQUER SENTINEL ADVERSE
-        if a.kind == SimMoveKind::Move && board.blocks_sentinel_threat(a.to, 3 - board.to_move) {
-            score_a += 90_000_000;
-        }
-        if b.kind == SimMoveKind::Move && board.blocks_sentinel_threat(b.to, 3 - board.to_move) {
-            score_b += 90_000_000;
-        }
-
-        // 4. Exit normal (Explorer/Vanguard)
-        if a.kind == SimMoveKind::Exit { score_a += 5_000_000; }
-        if b.kind == SimMoveKind::Exit { score_b += 5_000_000; }
-
-        // 5. Capture de Sentinel
-        if a.kind == SimMoveKind::Attack && a.captured_idx != 255 && board.pieces_kind[a.captured_idx as usize] == 2 {
-            score_a += 8_000_000;
-        }
-        if b.kind == SimMoveKind::Attack && b.captured_idx != 255 && board.pieces_kind[b.captured_idx as usize] == 2 {
-            score_b += 8_000_000;
-        }
-
-        // 6. Attack normal
-        if a.kind == SimMoveKind::Attack { score_a += 100_000; }
-        if b.kind == SimMoveKind::Attack { score_b += 100_000; }
-
-        // 7. Moves qui avancent vers la sortie
-        if a.kind == SimMoveKind::Move && a.to != 255 {
-            let y = (a.to / 10) as i32;
-            let target_y = if board.pieces_owner[a.piece_idx as usize] == 1 { 9 } else { 0 };
-            score_a += (target_y - y).abs() as i32 * 10_000;
-        }
-        if b.kind == SimMoveKind::Move && b.to != 255 {
-            let y = (b.to / 10) as i32;
-            let target_y = if board.pieces_owner[b.piece_idx as usize] == 1 { 9 } else { 0 };
-            score_b += (target_y - y).abs() as i32 * 10_000;
-        }
-
-        score_b.cmp(&score_a)
-    });
-}
-
-fn quiescence(
-    board: &mut BoardState,
-    mut alpha: i32,
-    beta: i32,
-    aborted: &mut bool,
-) -> i32 {
-    if fuel_left() < SAFETY_FUEL {
-        *aborted = true;
-        return 0;
-    }
-
-    let stand_pat = board.evaluate(board.to_move);
-    if stand_pat >= beta {
-        return beta;
-    }
-    alpha = alpha.max(stand_pat);
-
-    let mut captures = [SimMove::default(); 64];
-    let cap_count = board.generate_captures(&mut captures);
-    board.order_captures(&mut captures, cap_count);
-
-    for i in 0..cap_count {
-        let m = captures[i];
-        let (prev_sq, captured, exited) = board.apply(m);
-
-        let score = -quiescence(board, -beta, -alpha, aborted);
-
-        board.unmake(m, prev_sq, captured, exited);
-
-        if *aborted {
-            return 0;
-        }
-
-        if score >= beta {
-            return beta;
-        }
-        alpha = alpha.max(score);
-    }
-
-    alpha
-}
-
-fn negamax(
-    board: &mut BoardState,
-    depth: usize,
-    mut alpha: i32,
-    beta: i32,
-    aborted: &mut bool,
-) -> i32 {
-    if fuel_left() < SAFETY_FUEL {
-        *aborted = true;
-        return 0;
-    }
-
-    let alpha_orig = alpha;
-    let hash = zobrist_hash(&board.grid, board.to_move);
-    let tt_idx = (hash as usize) & TT_MASK;
-    let mut tt_move_sq = 255;
-
-    unsafe {
-        let entry = &TT[tt_idx];
-        if entry.flag != TTFlag::None && entry.key == hash && entry.depth >= (depth as u8) {
-            match entry.flag {
-                TTFlag::Exact => return entry.score,
-                TTFlag::LowerBound => alpha = alpha.max(entry.score),
-                TTFlag::UpperBound => {
-                    if entry.score <= alpha {
-                        return entry.score;
-                    }
-                }
-                TTFlag::None => {}
-            }
-            if alpha >= beta {
-                return entry.score;
-            }
-            tt_move_sq = entry.best_move_sq;
-        }
-    }
-
-    if board.sentinel_exited[1] || board.sentinel_exited[2] {
-        return board.evaluate(board.to_move);
-    }
-
-    if depth == 0 {
-        return quiescence(board, -INF, INF, aborted);
-    }
-
-    let mut moves = [SimMove::default(); 64];
-    let count = board.generate_moves(&mut moves);
-
-    if count == 0 {
-        return -SENTINEL_WIN + 50;
-    }
-
-    order_moves(&mut moves, count, tt_move_sq, board);
-
-    let mut max_eval = -INF;
-    let mut best_sq = 255;
-
-    for i in 0..count {
-        let m = moves[i];
-        let (prev_sq, captured, exited) = board.apply(m);
-
-        let eval = -negamax(board, depth - 1, -beta, -alpha, aborted);
-
-        board.unmake(m, prev_sq, captured, exited);
-
-        if *aborted {
-            return 0;
-        }
-
-        if eval > max_eval {
-            max_eval = eval;
-            best_sq = m.to;
-        }
-        if eval > alpha {
-            alpha = eval;
-        }
-        if alpha >= beta {
-            break;
-        }
-    }
-
-    unsafe {
-        let flag = if max_eval <= alpha_orig {
-            TTFlag::UpperBound
-        } else if max_eval >= beta {
-            TTFlag::LowerBound
-        } else {
-            TTFlag::Exact
-        };
-
-        TT[tt_idx] = TTEntry {
-            key: hash,
-            depth: depth as u8,
-            score: max_eval,
-            flag,
-            best_move_sq: best_sq,
-        };
-    }
-
-    max_eval
 }
 
 fn choose(turn: &Turn) -> usize {
@@ -803,8 +423,17 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // Si fuel très bas, retourne un move Exit ou Attack rapidement
-    if fuel_left() < 50_000_000 {
+    // Si fuel très bas, retourne un move rapide
+    if fuel_left() < SAFETY_FUEL {
+        let state = &turn.state;
+        let pieces = state.pieces();
+        for (i, m) in turn.moves.iter().enumerate() {
+            if m.kind == MoveKind::Exit {
+                if m.piece as usize < pieces.len() && pieces[m.piece as usize].kind as u8 == 2 {
+                    return i; // Sentinel Exit = priorité absolue
+                }
+            }
+        }
         for (i, m) in turn.moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
                 return i;
@@ -818,131 +447,95 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    let max_depth = if fuel_left() > 1_000_000_000 {
-        12
-    } else if fuel_left() > 500_000_000 {
-        10
+    let mut board = BoardState::from_turn(turn);
+    let mut root_moves = [SimMove::default(); 64];
+    let root_count = board.generate_moves(&mut root_moves);
+
+    if root_count == 0 {
+        return 0;
+    }
+
+    // Initialise MCTS
+    let mut root = MCTSNode::new();
+    root.untried_moves = (0..root_count).collect();
+
+    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
+    let mut iterations = 0;
+
+    while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
+        let mut node = &mut root;
+        let mut path = Vec::new();
+        let mut board_stack = Vec::new();
+        board_stack.push(board.clone());
+
+        // Sélection
+        loop {
+            if node.untried_moves.is_empty() && node.children.is_empty() {
+                break;
+            }
+            if !node.untried_moves.is_empty() {
+                break;
+            }
+
+            let best_idx = node.children.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    let uct_a = a.uct_value(1.414, node.visits);
+                    let uct_b = b.uct_value(1.414, node.visits);
+                    uct_a.partial_cmp(&uct_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+
+            path.push(node);
+            node = &mut node.children[best_idx];
+
+            // Applique le move
+            let m = root_moves[node.move_index];
+            let (prev_sq, captured, exited) = board_stack.last_mut().unwrap().apply(m);
+            board_stack.push(board_stack.last().unwrap().clone());
+        }
+
+        // Expansion
+        if !node.untried_moves.is_empty() {
+            let move_idx = node.untried_moves.remove(rng.gen_range(0..node.untried_moves.len()));
+            let m = root_moves[move_idx];
+
+            let mut child = MCTSNode::new();
+            child.move_index = move_idx;
+            node.children.push(child);
+
+            node = &mut node.children.last_mut().unwrap();
+            path.push(node);
+
+            // Applique le move
+            let (prev_sq, captured, exited) = board_stack.last_mut().unwrap().apply(m);
+            board_stack.push(board_stack.last().unwrap().clone());
+        }
+
+        // Simulation
+        let mut sim_board = board_stack.last().unwrap().clone();
+        let result = simulate(&mut sim_board, &mut rng);
+
+        // Backpropagation
+        for node in &mut path {
+            node.visits += 1;
+            node.total_value += result;
+        }
+
+        // Restaure l'état
+        board = board_stack[0].clone();
+
+        iterations += 1;
+    }
+
+    // Retourne le move avec le plus de visites
+    if !root.children.is_empty() {
+        let best_idx = root.best_child();
+        root.children[best_idx].move_index
     } else {
-        8
-    };
-
-    let state = &turn.state;
-    let pieces = state.pieces();
-    let my_side = state.to_move;
-
-    // Priorité absolue : faire sortir un Sentinel si possible
-    for (i, m) in turn.moves.iter().enumerate() {
-        if m.kind == MoveKind::Exit {
-            let p = m.piece as usize;
-            if p < pieces.len() && pieces[p].kind as u8 == 2 {
-                return i;
-            }
-        }
+        0
     }
-
-    let mut board = BoardState {
-        pieces_sq: [255; 16],
-        pieces_kind: [0; 16],
-        pieces_owner: [0; 16],
-        pieces_alive: [false; 16],
-        piece_count: pieces.len().min(16),
-        grid: [255; 100],
-        heights: [0; 100],
-        to_move: my_side,
-        sentinel_exited: [false; 3],
-    };
-
-    for (i, &h) in state.heights.iter().enumerate().take(100) {
-        board.heights[i] = h;
-    }
-
-    for (i, p) in pieces.iter().enumerate().take(board.piece_count) {
-        board.pieces_sq[i] = p.sq;
-        board.pieces_kind[i] = p.kind as u8;
-        board.pieces_owner[i] = p.owner;
-        board.pieces_alive[i] = p.sq != 255;
-        if p.sq != 255 && (p.sq as usize) < 100 {
-            board.grid[p.sq as usize] = i as u8;
-        }
-    }
-
-    let mut root_moves: Vec<(usize, SimMove)> = turn
-        .moves
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let k = match m.kind {
-                MoveKind::Exit => SimMoveKind::Exit,
-                MoveKind::Attack => SimMoveKind::Attack,
-                _ => SimMoveKind::Move,
-            };
-            let cap = if m.to != 255 { board.grid[m.to as usize] } else { 255 };
-            (
-                i,
-                SimMove {
-                    piece_idx: m.piece,
-                    from: pieces[m.piece as usize].sq,
-                    to: m.to,
-                    kind: k,
-                    cost: m.cost,
-                    captured_idx: cap,
-                },
-            )
-        })
-        .collect();
-
-    root_moves.sort_by_key(|(_, m)| {
-        let mut p = 0;
-        if m.kind == SimMoveKind::Exit && board.pieces_kind[m.piece_idx as usize] == 2 {
-            p += 1_000_000;
-        } else if m.kind == SimMoveKind::Exit {
-            p += 100_000;
-        } else if m.kind == SimMoveKind::Attack {
-            p += 20_000;
-        }
-        -p
-    });
-
-    let mut best_move_idx = root_moves[0].0;
-
-    for depth in 1..=max_depth.min(MAX_DEPTH) {
-        if fuel_left() < SAFETY_FUEL {
-            break;
-        }
-
-        let mut depth_best = root_moves[0].0;
-        let mut alpha = -INF;
-        let beta = INF;
-        let mut aborted = false;
-
-        for &(orig_idx, m) in &root_moves {
-            if fuel_left() < SAFETY_FUEL {
-                aborted = true;
-                break;
-            }
-
-            let (prev_sq, captured, exited) = board.apply(m);
-            let score = -negamax(&mut board, depth - 1, -beta, -alpha, &mut aborted);
-            board.unmake(m, prev_sq, captured, exited);
-
-            if aborted {
-                break;
-            }
-
-            if score > alpha {
-                alpha = score;
-                depth_best = orig_idx;
-            }
-        }
-
-        if !aborted {
-            best_move_idx = depth_best;
-        } else {
-            break;
-        }
-    }
-
-    best_move_idx
 }
 
 bot!(choose);
