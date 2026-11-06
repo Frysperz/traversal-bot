@@ -1,5 +1,6 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
+use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
@@ -104,10 +105,12 @@ impl BoardState {
                 self.grid[target] = m.piece_idx;
                 self.pieces_sq[p] = m.to;
             }
-            MoveKind::Move => {
-                self.grid[m.from as usize] = 255;
-                self.grid[m.to as usize] = m.piece_idx;
-                self.pieces_sq[p] = m.to;
+            MoveKind::Move | MoveKind::Pass => {
+                if m.to != 255 {
+                    self.grid[m.from as usize] = 255;
+                    self.grid[m.to as usize] = m.piece_idx;
+                    self.pieces_sq[p] = m.to;
+                }
             }
         }
 
@@ -362,7 +365,7 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
             if m.kind == MoveKind::Exit {
                 scores[i] = 10_000.0;
                 if board.pieces_kind[m.piece_idx as usize] == 2 {
-                    scores[i] += 100_000.0; // Sentinel = victoire
+                    scores[i] += 100_000.0;
                 }
             } else if m.kind == MoveKind::Attack {
                 scores[i] = 1000.0;
@@ -374,7 +377,7 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
                 let target_y = if board.to_move == 1 { 9 } else { 0 };
                 scores[i] = (target_y - y).abs() as f32 * 100.0;
                 if board.blocks_sentinel(m.to) {
-                    scores[i] += 50_000.0; // Bloquer Sentinel adverse
+                    scores[i] += 50_000.0;
                 }
             }
         }
@@ -430,22 +433,22 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // MCTS avec gestion d'arbre simplifiée
+    // MCTS simplifié
     let mut root = MCTSNode::new();
     root.untried_moves = (0..root_count).collect();
 
-    let mut rng = ChaCha8Rng::from_seed(turn.seed.to_le_bytes());
+    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
     let mut iterations = 0;
 
     while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
-        let mut current_node = 0; // Index du nœud courant
         let mut nodes = vec![root.clone()];
         let mut board_states = vec![board.clone()];
         let mut path = Vec::new();
+        let mut current_node_idx = 0;
 
         // Sélection
         loop {
-            let node = &mut nodes[current_node];
+            let node = &mut nodes[current_node_idx];
             if node.untried_moves.is_empty() && node.children.is_empty() {
                 break;
             }
@@ -453,7 +456,6 @@ fn choose(turn: &Turn) -> usize {
                 break;
             }
 
-            // Trouve le meilleur enfant
             let best_idx = node.children.iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| {
@@ -464,17 +466,16 @@ fn choose(turn: &Turn) -> usize {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
-            path.push(current_node);
-            current_node = best_idx + nodes.len(); // Les enfants sont stockés après
+            path.push(current_node_idx);
             nodes.push(node.children[best_idx].clone());
+            current_node_idx = nodes.len() - 1;
 
-            // Applique le move
-            let m = root_moves[nodes[current_node].move_index];
+            let m = root_moves[nodes[current_node_idx].move_index];
             board_states.last_mut().unwrap().apply(m);
         }
 
         // Expansion
-        let node = &mut nodes[current_node];
+        let node = &mut nodes[current_node_idx];
         if !node.untried_moves.is_empty() {
             let move_idx = node.untried_moves.remove(rng.gen_range(0..node.untried_moves.len()));
             let m = root_moves[move_idx];
@@ -483,11 +484,9 @@ fn choose(turn: &Turn) -> usize {
             child.move_index = move_idx;
             node.children.push(child.clone());
             nodes.push(child);
+            current_node_idx = nodes.len() - 1;
+            path.push(current_node_idx);
 
-            current_node = nodes.len() - 1;
-            path.push(current_node);
-
-            // Applique le move
             board_states.last_mut().unwrap().apply(m);
         }
 
@@ -501,7 +500,7 @@ fn choose(turn: &Turn) -> usize {
             nodes[node_idx].total_value += result;
         }
 
-        // On ne garde que la racine pour la prochaine itération
+        // On garde la racine mise à jour
         root = nodes[0].clone();
         iterations += 1;
     }
@@ -511,7 +510,6 @@ fn choose(turn: &Turn) -> usize {
         let best_idx = root.best_child();
         root.children[best_idx].move_index
     } else {
-        // Si pas d'enfants, retourne le premier move Exit ou Attack
         for (i, m) in root_moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
                 return i;
