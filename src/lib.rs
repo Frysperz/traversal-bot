@@ -6,7 +6,6 @@ use rand_chacha::ChaCha8Rng;
 
 const SAFETY_FUEL: u64 = 50_000_000;
 const MAX_ITERATIONS: usize = 1500;
-const SENTINEL_WIN_SCORE: f32 = 10_000.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimMoveKind {
@@ -277,11 +276,32 @@ impl BoardState {
 
         (false, 0.0)
     }
-}
 
-impl Clone for BoardState {
-    fn clone(&self) -> Self {
-        *self
+    fn blocks_sentinel(&self, to_sq: u8) -> bool {
+        let to_sq = to_sq as usize;
+        let to_x = to_sq % 10;
+        let to_y = to_sq / 10;
+        let opp = 3 - self.to_move;
+
+        for i in 0..self.piece_count {
+            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
+                continue;
+            }
+            let sent_sq = self.pieces_sq[i] as usize;
+            let sent_x = sent_sq % 10;
+            let sent_y = sent_sq / 10;
+            let exit_row = if opp == 1 { 9 } else { 0 };
+
+            if (sent_y as i32).abs_diff(exit_row as i32) == 1 {
+                if (to_y as i32).abs_diff(sent_y as i32) <= 1 && (to_x as i32).abs_diff(sent_x as i32) <= 1 {
+                    return true;
+                }
+                if to_y == exit_row && to_x == sent_x {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -350,18 +370,17 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
             if m.kind == SimMoveKind::Exit {
                 scores[i] = 10_000.0;
                 if board.pieces_kind[m.piece_idx as usize] == 2 {
-                    scores[i] += 100_000.0; // Sentinel = priorité absolue
+                    scores[i] += 100_000.0;
                 }
             } else if m.kind == SimMoveKind::Attack {
                 scores[i] = 1000.0;
                 if m.captured_idx != 255 && board.pieces_kind[m.captured_idx as usize] == 2 {
-                    scores[i] += 50_000.0; // Capture Sentinel
+                    scores[i] += 50_000.0;
                 }
             } else if m.to != 255 {
                 let y = (m.to / 10) as i32;
                 let target_y = if board.to_move == 1 { 9 } else { 0 };
                 scores[i] = (target_y - y).abs() as f32 * 100.0;
-                // Bonus si on bloque un Sentinel adverse
                 if board.blocks_sentinel(m.to) {
                     scores[i] += 50_000.0;
                 }
@@ -387,35 +406,6 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
     }
 }
 
-impl BoardState {
-    fn blocks_sentinel(&self, to_sq: u8) -> bool {
-        let to_sq = to_sq as usize;
-        let to_x = to_sq % 10;
-        let to_y = to_sq / 10;
-        let opp = 3 - self.to_move;
-
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
-                continue;
-            }
-            let sent_sq = self.pieces_sq[i] as usize;
-            let sent_x = sent_sq % 10;
-            let sent_y = sent_sq / 10;
-            let exit_row = if opp == 1 { 9 } else { 0 };
-
-            if (sent_y as i32).abs_diff(exit_row as i32) == 1 {
-                if (to_y as i32).abs_diff(sent_y as i32) <= 1 && (to_x as i32).abs_diff(sent_x as i32) <= 1 {
-                    return true;
-                }
-                if to_y == exit_row && to_x == sent_x {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
-
 fn choose(turn: &Turn) -> usize {
     if turn.moves.is_empty() {
         return 0;
@@ -428,7 +418,7 @@ fn choose(turn: &Turn) -> usize {
         for (i, m) in turn.moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
                 if (m.piece as usize) < pieces.len() && pieces[m.piece as usize].kind as u8 == 2 {
-                    return i; // Sentinel Exit = priorité absolue
+                    return i;
                 }
             }
         }
@@ -457,7 +447,7 @@ fn choose(turn: &Turn) -> usize {
     let mut root = MCTSNode::new();
     root.untried_moves = (0..root_count).collect();
 
-    let mut rng = ChaCha8Rng::from_seed(turn.seed.into());
+    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
     let mut iterations = 0;
 
     while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
