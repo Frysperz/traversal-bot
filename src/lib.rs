@@ -1,28 +1,36 @@
-use traversal_bot::core::MoveKind;
+use traversal_bot::core::{Move, MoveKind, PieceKind, Player};
 use traversal_bot::{bot, fuel_left, Turn};
-use rand::SeedableRng;
-use rand::Rng;
-use rand_chacha::ChaCha8Rng;
 
-const SAFETY_FUEL: u64 = 50_000_000;
-const MAX_ITERATIONS: usize = 1500;
+const SAFETY_FUEL: u64 = 150_000_000;
+const MAX_DEPTH: u32 = 12;
+const INF: i32 = 10_000_000;
 
-#[derive(Clone, Copy, Debug)]
-pub struct SimMove {
-    pub piece_idx: u8,
-    pub from: u8,
-    pub to: u8,
-    pub kind: MoveKind,
-    pub cost: u8,
-    pub captured_idx: u8,
+// Scores pour l'évaluation
+const SENTINEL_EXIT_WIN: i32 = 1_000_000;
+const SENTINEL_THREAT: i32 = 50_000;
+const SENTINEL_BLOCK: i32 = 40_000;
+const SENTINEL_CAPTURE: i32 = 80_000;
+const VANGUARD_VALUE: i32 = 2_000;
+const EXPLORER_VALUE: i32 = 1_500;
+const HEIGHT_BONUS: i32 = 100;
+const PROGRESS_BONUS: i32 = 300;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SimMove {
+    piece_idx: u8,
+    from: u8,
+    to: u8,
+    kind: MoveKind,
+    cost: u8,
+    captured_idx: u8,
 }
 
 impl Default for SimMove {
     fn default() -> Self {
         SimMove {
-            piece_idx: 0,
-            from: 0,
-            to: 0,
+            piece_idx: 255,
+            from: 255,
+            to: 255,
             kind: MoveKind::Move,
             cost: 0,
             captured_idx: 255,
@@ -30,199 +38,236 @@ impl Default for SimMove {
     }
 }
 
+struct BoardState {
+    pieces: [Option<Piece>; 16],
+    grid: [u8; 100],
+    heights: [u8; 100],
+    to_move: Player,
+    sentinel_exited: [bool; 2],
+}
+
 #[derive(Clone, Copy)]
-pub struct BoardState {
-    pub pieces_sq: [u8; 16],
-    pub pieces_kind: [u8; 16],
-    pub pieces_owner: [u8; 16],
-    pub pieces_alive: [bool; 16],
-    pub piece_count: usize,
-    pub grid: [u8; 100],
-    pub heights: [u8; 100],
-    pub to_move: u8,
-    pub sentinel_exited: [bool; 3],
+struct Piece {
+    idx: u8,
+    kind: PieceKind,
+    owner: Player,
+    sq: u8,
 }
 
 impl BoardState {
     fn from_turn(turn: &Turn) -> Self {
-        let state = &turn.state;
-        let pieces = state.pieces();
-        let my_side = state.to_move;
+        let mut pieces = [None; 16];
+        let mut grid = [255; 100];
+        let mut heights = [0; 100];
 
-        let mut board = Self {
-            pieces_sq: [255; 16],
-            pieces_kind: [0; 16],
-            pieces_owner: [0; 16],
-            pieces_alive: [false; 16],
-            piece_count: pieces.len().min(16),
-            grid: [255; 100],
-            heights: [0; 100],
-            to_move: my_side,
-            sentinel_exited: [false; 3],
-        };
-
-        for (i, &h) in state.heights.iter().enumerate().take(100) {
-            board.heights[i] = h;
-        }
-
-        for (i, p) in pieces.iter().enumerate().take(board.piece_count) {
-            board.pieces_sq[i] = p.sq;
-            board.pieces_kind[i] = p.kind as u8;
-            board.pieces_owner[i] = p.owner;
-            board.pieces_alive[i] = p.sq != 255;
-            if p.sq != 255 && (p.sq as usize) < 100 {
-                board.grid[p.sq as usize] = i as u8;
+        for (i, piece) in turn.pieces.iter().enumerate() {
+            if piece.alive {
+                let p = Piece {
+                    idx: i as u8,
+                    kind: piece.kind,
+                    owner: piece.owner,
+                    sq: piece.square,
+                };
+                pieces[i] = Some(p);
+                grid[piece.square as usize] = i as u8;
+                heights[piece.square as usize] = piece.height;
             }
         }
 
-        board
+        BoardState {
+            pieces,
+            grid,
+            heights,
+            to_move: turn.player,
+            sentinel_exited: [false, false],
+        }
     }
 
     fn apply(&mut self, m: SimMove) -> (u8, u8, bool) {
-        let p = m.piece_idx as usize;
-        let prev_sq = self.pieces_sq[p];
-        let mut captured = 255;
+        let piece = self.pieces[m.piece_idx as usize].unwrap();
+        let prev_sq = piece.sq;
+        let mut captured = 255u8;
         let mut exited = false;
 
         match m.kind {
             MoveKind::Exit => {
-                self.grid[m.from as usize] = 255;
-                self.pieces_sq[p] = 255;
-                self.pieces_alive[p] = false;
+                self.grid[prev_sq as usize] = 255;
+                if let Some(p) = &mut self.pieces[m.piece_idx as usize] {
+                    p.sq = 255;
+                }
                 exited = true;
-                if self.pieces_kind[p] == 2 {
+                if piece.kind == PieceKind::Sentinel {
                     self.sentinel_exited[self.to_move as usize] = true;
                 }
             }
             MoveKind::Attack => {
-                let target = m.to as usize;
-                captured = self.grid[target];
-                if captured != 255 {
-                    self.pieces_alive[captured as usize] = false;
-                    self.pieces_sq[captured as usize] = 255;
+                let target_idx = self.grid[m.to as usize];
+                if target_idx != 255 {
+                    captured = target_idx;
+                    if let Some(target_piece) = &mut self.pieces[target_idx as usize] {
+                        target_piece.sq = 255;
+                    }
                 }
-                self.grid[m.from as usize] = 255;
-                self.grid[target] = m.piece_idx;
-                self.pieces_sq[p] = m.to;
+                self.grid[prev_sq as usize] = 255;
+                self.grid[m.to as usize] = m.piece_idx;
+                if let Some(p) = &mut self.pieces[m.piece_idx as usize] {
+                    p.sq = m.to;
+                }
             }
             MoveKind::Move | MoveKind::Pass => {
-                if m.to != 255 {
-                    self.grid[m.from as usize] = 255;
-                    self.grid[m.to as usize] = m.piece_idx;
-                    self.pieces_sq[p] = m.to;
+                self.grid[prev_sq as usize] = 255;
+                self.grid[m.to as usize] = m.piece_idx;
+                if let Some(p) = &mut self.pieces[m.piece_idx as usize] {
+                    p.sq = m.to;
                 }
             }
         }
 
-        self.to_move = if self.to_move == 1 { 2 } else { 1 };
+        self.to_move = self.to_move.opponent();
         (prev_sq, captured, exited)
+    }
+
+    fn unmake(&mut self, m: SimMove, prev_sq: u8, captured: u8, exited: bool) {
+        self.to_move = self.to_move.opponent();
+
+        if exited {
+            if let Some(p) = &mut self.pieces[m.piece_idx as usize] {
+                p.sq = prev_sq;
+            }
+            self.grid[prev_sq as usize] = m.piece_idx;
+            if let Some(piece) = self.pieces[m.piece_idx as usize] {
+                if piece.kind == PieceKind::Sentinel {
+                    self.sentinel_exited[self.to_move as usize] = false;
+                }
+            }
+        } else {
+            self.grid[m.to as usize] = 255;
+            self.grid[prev_sq as usize] = m.piece_idx;
+            if let Some(p) = &mut self.pieces[m.piece_idx as usize] {
+                p.sq = prev_sq;
+            }
+
+            if captured != 255 {
+                if let Some(cap_piece) = &mut self.pieces[captured as usize] {
+                    cap_piece.sq = m.to;
+                }
+                self.grid[m.to as usize] = captured;
+            }
+        }
     }
 
     fn generate_moves(&self, buffer: &mut [SimMove; 64]) -> usize {
         let mut count = 0;
-        let opp = if self.to_move == 1 { 2 } else { 1 };
-        let exit_row = if self.to_move == 1 { 9 } else { 0 };
+        let opp = self.to_move.opponent();
+        let exit_row = if self.to_move == Player::Red { 9 } else { 0 };
 
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != self.to_move {
-                continue;
-            }
-
-            let sq = self.pieces_sq[i] as usize;
-            let x = (sq % 10) as i32;
-            let y = (sq / 10) as i32;
-            let ch = self.heights[sq] as i32;
-            let kind = self.pieces_kind[i];
-
-            if y == exit_row && count < 64 {
-                buffer[count] = SimMove {
-                    piece_idx: i as u8,
-                    from: sq as u8,
-                    to: 255,
-                    kind: MoveKind::Exit,
-                    cost: 1,
-                    captured_idx: 255,
-                };
-                count += 1;
-            }
-
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let nx = x + dx;
-                let ny = y + dy;
-
-                if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-                    let nsq = (ny * 10 + nx) as usize;
-                    let occ = self.grid[nsq];
-                    let nh = self.heights[nsq] as i32;
-
-                    if occ == 255 {
-                        let cost = (1 + (nh - ch).max(0)) as u8;
-                        if count < 64 {
-                            buffer[count] = SimMove {
-                                piece_idx: i as u8,
-                                from: sq as u8,
-                                to: nsq as u8,
-                                kind: MoveKind::Move,
-                                cost,
-                                captured_idx: 255,
-                            };
-                            count += 1;
-                        }
-                    } else if self.pieces_owner[occ as usize] == opp {
-                        let att = match kind { 2 => 3, 1 => 2, _ => 1 } + if ch > nh { 1 } else { 0 };
-                        let def = match self.pieces_kind[occ as usize] { 2 => 3, 1 => 2, _ => 1 } + if nh > ch { 1 } else { 0 };
-
-                        if att >= def && count < 64 {
-                            buffer[count] = SimMove {
-                                piece_idx: i as u8,
-                                from: sq as u8,
-                                to: nsq as u8,
-                                kind: MoveKind::Attack,
-                                cost: 2,
-                                captured_idx: occ,
-                            };
-                            count += 1;
-                        }
-                    }
+        for i in 0..16 {
+            if let Some(piece) = self.pieces[i] {
+                if piece.owner != self.to_move {
+                    continue;
                 }
-            }
 
-            // Explorer: diagonal et leap
-            if kind == 0 {
-                for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                    let nx = x + dx;
-                    let ny = y + dy;
+                let sq = piece.sq as usize;
+                let x = sq % 10;
+                let y = sq / 10;
+                let h = self.heights[sq] as i32;
+
+                // Exit move
+                if y == exit_row && count < 64 {
+                    buffer[count] = SimMove {
+                        piece_idx: i as u8,
+                        from: sq as u8,
+                        to: 255,
+                        kind: MoveKind::Exit,
+                        cost: 1,
+                        captured_idx: 255,
+                    };
+                    count += 1;
+                }
+
+                // Standard moves (orthogonal)
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
                     if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
                         let nsq = (ny * 10 + nx) as usize;
-                        if self.grid[nsq] == 255 && count < 64 {
-                            buffer[count] = SimMove {
-                                piece_idx: i as u8,
-                                from: sq as u8,
-                                to: nsq as u8,
-                                kind: MoveKind::Move,
-                                cost: 1,
-                                captured_idx: 255,
-                            };
-                            count += 1;
+                        let occ = self.grid[nsq];
+                        let nh = self.heights[nsq] as i32;
+
+                        if occ == 255 {
+                            let cost = (1 + (nh - h).max(0)) as u8;
+                            if count < 64 {
+                                buffer[count] = SimMove {
+                                    piece_idx: i as u8,
+                                    from: sq as u8,
+                                    to: nsq as u8,
+                                    kind: MoveKind::Move,
+                                    cost,
+                                    captured_idx: 255,
+                                };
+                                count += 1;
+                            }
+                        } else if self.pieces[occ as usize].unwrap().owner == opp {
+                            let att = self.attack_value(piece.kind, h, nh);
+                            let def = self.attack_value(
+                                self.pieces[occ as usize].unwrap().kind,
+                                nh,
+                                h,
+                            );
+                            if att >= def && count < 64 {
+                                buffer[count] = SimMove {
+                                    piece_idx: i as u8,
+                                    from: sq as u8,
+                                    to: nsq as u8,
+                                    kind: MoveKind::Attack,
+                                    cost: 2,
+                                    captured_idx: occ,
+                                };
+                                count += 1;
+                            }
                         }
                     }
                 }
 
-                for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
-                    let nx = x + dx;
-                    let ny = y + dy;
-                    if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
-                        let nsq = (ny * 10 + nx) as usize;
-                        if self.grid[nsq] == 255 && count < 64 {
-                            buffer[count] = SimMove {
-                                piece_idx: i as u8,
-                                from: sq as u8,
-                                to: nsq as u8,
-                                kind: MoveKind::Move,
-                                cost: 1,
-                                captured_idx: 255,
-                            };
-                            count += 1;
+                // Explorer special moves
+                if piece.kind == PieceKind::Explorer {
+                    // Diagonal moves (1 square)
+                    for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                            let nsq = (ny * 10 + nx) as usize;
+                            if self.grid[nsq] == 255 && count < 64 {
+                                buffer[count] = SimMove {
+                                    piece_idx: i as u8,
+                                    from: sq as u8,
+                                    to: nsq as u8,
+                                    kind: MoveKind::Move,
+                                    cost: 1,
+                                    captured_idx: 255,
+                                };
+                                count += 1;
+                            }
+                        }
+                    }
+
+                    // Leap moves (2 squares orthogonal)
+                    for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                            let nsq = (ny * 10 + nx) as usize;
+                            if self.grid[nsq] == 255 && count < 64 {
+                                buffer[count] = SimMove {
+                                    piece_idx: i as u8,
+                                    from: sq as u8,
+                                    to: nsq as u8,
+                                    kind: MoveKind::Move,
+                                    cost: 1,
+                                    captured_idx: 255,
+                                };
+                                count += 1;
+                            }
                         }
                     }
                 }
@@ -231,43 +276,117 @@ impl BoardState {
         count
     }
 
-    fn is_terminal(&self) -> (bool, f32) {
-        if self.sentinel_exited[1] {
-            return (true, 1.0);
-        }
-        if self.sentinel_exited[2] {
-            return (true, -1.0);
-        }
-
-        let mut moves = [SimMove::default(); 64];
-        if self.generate_moves(&mut moves) == 0 {
-            return (true, 0.0);
-        }
-
-        (false, 0.0)
+    fn attack_value(&self, kind: PieceKind, h: i32, target_h: i32) -> i32 {
+        let base = match kind {
+            PieceKind::Sentinel => 3,
+            PieceKind::Vanguard => 2,
+            PieceKind::Explorer => 1,
+        };
+        base + if h > target_h { 1 } else { 0 }
     }
 
-    fn blocks_sentinel(&self, to_sq: u8) -> bool {
-        let to_sq = to_sq as usize;
-        let to_x = to_sq % 10;
-        let to_y = to_sq / 10;
-        let opp = 3 - self.to_move;
+    fn evaluate(&self) -> i32 {
+        let side = self.to_move;
+        let opp = side.opponent();
 
-        for i in 0..self.piece_count {
-            if !self.pieces_alive[i] || self.pieces_owner[i] != opp || self.pieces_kind[i] != 2 {
-                continue;
-            }
-            let sent_sq = self.pieces_sq[i] as usize;
-            let sent_x = sent_sq % 10;
-            let sent_y = sent_sq / 10;
-            let exit_row = if opp == 1 { 9 } else { 0 };
+        // 1. Check for instant win/loss via Sentinel exit
+        if self.sentinel_exited[side as usize] {
+            return -SENTINEL_EXIT_WIN;
+        }
+        if self.sentinel_exited[opp as usize] {
+            return SENTINEL_EXIT_WIN;
+        }
 
-            if (sent_y as i32).abs_diff(exit_row as i32) == 1 {
-                if (to_y as i32).abs_diff(sent_y as i32) <= 1 && (to_x as i32).abs_diff(sent_x as i32) <= 1 {
-                    return true;
+        let mut score = 0;
+
+        // 2. Evaluate pieces
+        for i in 0..16 {
+            if let Some(piece) = self.pieces[i] {
+                let value = match piece.kind {
+                    PieceKind::Sentinel => 3_000,
+                    PieceKind::Vanguard => VANGUARD_VALUE,
+                    PieceKind::Explorer => EXPLORER_VALUE,
+                };
+
+                let sign = if piece.owner == side { 1 } else { -1 };
+                score += value * sign;
+
+                // Progress bonus (distance to exit)
+                let y = (piece.sq / 10) as i32;
+                let dist_to_exit = if piece.owner == Player::Red {
+                    9 - y
+                } else {
+                    y
+                };
+                let progress = dist_to_exit * PROGRESS_BONUS;
+                score += progress * sign * match piece.kind {
+                    PieceKind::Sentinel => 3,
+                    PieceKind::Vanguard => 2,
+                    PieceKind::Explorer => 1,
+                };
+
+                // Height bonus
+                let h = self.heights[piece.sq as usize] as i32;
+                score += (h * HEIGHT_BONUS) * sign;
+
+                // Bonus for being on exit row
+                let exit_row = if piece.owner == Player::Red { 9 } else { 0 };
+                if (piece.sq / 10) as i32 == exit_row {
+                    score += 5_000 * sign;
                 }
-                if to_y == exit_row && to_x == sent_x {
-                    return true;
+            }
+        }
+
+        // 3. Sentinel-specific bonuses
+        for i in 0..16 {
+            if let Some(piece) = self.pieces[i] {
+                if piece.kind == PieceKind::Sentinel {
+                    let exit_row = if piece.owner == Player::Red { 9 } else { 0 };
+                    let y = (piece.sq / 10) as i32;
+                    let dist = (exit_row - y).abs();
+
+                    // Urgent: opponent sentinel is about to exit
+                    if piece.owner == opp && dist <= 2 {
+                        score -= SENTINEL_THREAT * (3 - dist);
+                    }
+
+                    // Our sentinel is close to exit
+                    if piece.owner == side && dist <= 2 {
+                        score += SENTINEL_THREAT * (3 - dist);
+                    }
+                }
+            }
+        }
+
+        // 4. Control of center and high ground
+        for sq in 0..100 {
+            let y = sq / 10;
+            let x = sq % 10;
+            let h = self.heights[sq] as i32;
+
+            // Center control bonus
+            let center_dist = ((x as i32 - 4.5).abs() + (y as i32 - 4.5).abs()) as i32;
+            let center_bonus = (5 - center_dist).max(0) * h * 50;
+
+            if self.grid[sq] != 255 {
+                let piece_idx = self.grid[sq] as usize;
+                if let Some(piece) = self.pieces[piece_idx] {
+                    let sign = if piece.owner == side { 1 } else { -1 };
+                    score += center_bonus * sign;
+                }
+            }
+        }
+
+        score
+    }
+
+    fn is_sentinel_threatened(&self, player: Player) -> bool {
+        for i in 0..16 {
+            if let Some(piece) = self.pieces[i] {
+                if piece.kind == PieceKind::Sentinel && piece.owner == player {
+                    let exit_row = if player == Player::Red { 9 } else { 0 };
+                    let y = (piece.sq / 10) as i32;
+                    return (exit_row - y).abs() <= 1;
                 }
             }
         }
@@ -275,224 +394,290 @@ impl BoardState {
     }
 }
 
-#[derive(Clone)]
-struct MCTSNode {
-    visits: u32,
-    total_value: f32,
-    children: Vec<MCTSNode>,
-    untried_moves: Vec<usize>,
-    move_index: usize,
-}
-
-impl MCTSNode {
-    fn new() -> Self {
-        Self {
-            visits: 0,
-            total_value: 0.0,
-            children: Vec::new(),
-            untried_moves: Vec::new(),
-            move_index: 0,
-        }
-    }
-
-    fn uct_value(&self, exploration_weight: f32, parent_visits: u32) -> f32 {
-        if self.visits == 0 {
-            return f32::INFINITY;
-        }
-        let exploitation = self.total_value / self.visits as f32;
-        let exploration = exploration_weight * (2.0 * (parent_visits as f32).ln() / self.visits as f32).sqrt();
-        exploitation + exploration
-    }
-
-    fn best_child(&self) -> usize {
-        self.children.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.visits.cmp(&b.visits))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
-}
-
-fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
-    let mut ply = 0;
-
-    loop {
-        ply += 1;
-        if ply > 150 {
-            return 0.0;
-        }
-
-        let (terminal, result) = board.is_terminal();
-        if terminal {
-            return result;
-        }
-
-        let mut moves = [SimMove::default(); 64];
-        let count = board.generate_moves(&mut moves);
-        if count == 0 {
-            return 0.0;
-        }
-
-        // Priorité absolue aux Sentinels
-        let mut scores = vec![0.0; count];
-        for i in 0..count {
-            let m = &moves[i];
-            if m.kind == MoveKind::Exit {
-                scores[i] = 10_000.0;
-                if board.pieces_kind[m.piece_idx as usize] == 2 {
-                    scores[i] += 100_000.0;
-                }
-            } else if m.kind == MoveKind::Attack {
-                scores[i] = 1000.0;
-                if m.captured_idx != 255 && board.pieces_kind[m.captured_idx as usize] == 2 {
-                    scores[i] += 50_000.0;
-                }
-            } else if m.to != 255 {
-                let y = (m.to / 10) as i32;
-                let target_y = if board.to_move == 1 { 9 } else { 0 };
-                scores[i] = (target_y - y).abs() as f32 * 100.0;
-                if board.blocks_sentinel(m.to) {
-                    scores[i] += 50_000.0;
-                }
-            }
-        }
-
-        // Sélection pondérée
-        let total: f32 = scores.iter().sum();
-        if total > 0.0 {
-            let r = rng.gen_range(0.0..total);
-            let mut sum = 0.0;
-            for (i, &s) in scores.iter().enumerate() {
-                sum += s;
-                if sum >= r {
-                    board.apply(moves[i]);
-                    break;
-                }
-            }
-        } else {
-            let i = rng.gen_range(0..count);
-            board.apply(moves[i]);
-        }
-    }
-}
-
-fn choose(turn: &Turn) -> usize {
-    if turn.moves.is_empty() {
-        return 0;
-    }
-
-    // Mode rapide si fuel bas
+fn quiescence(board: &mut BoardState, mut alpha: i32, beta: i32, aborted: &mut bool) -> i32 {
     if fuel_left() < SAFETY_FUEL {
-        let state = &turn.state;
-        let pieces = state.pieces();
-        for (i, m) in turn.moves.iter().enumerate() {
-            if m.kind == MoveKind::Exit {
-                if (m.piece as usize) < pieces.len() && pieces[m.piece as usize].kind as u8 == 2 {
-                    return i;
+        *aborted = true;
+        return 0;
+    }
+
+    let stand_pat = board.evaluate();
+    if stand_pat >= beta {
+        return beta;
+    }
+    alpha = alpha.max(stand_pat);
+
+    // Generate only captures
+    let mut captures = [SimMove::default(); 64];
+    let cap_count = board.generate_captures(&mut captures);
+
+    for i in 0..cap_count {
+        let m = captures[i];
+        let (prev_sq, captured, exited) = board.apply(m);
+        let score = -quiescence(board, -beta, -alpha, aborted);
+        board.unmake(m, prev_sq, captured, exited);
+
+        if *aborted {
+            return 0;
+        }
+
+        if score >= beta {
+            return beta;
+        }
+        alpha = alpha.max(score);
+    }
+
+    alpha
+}
+
+impl BoardState {
+    fn generate_captures(&self, buffer: &mut [SimMove; 64]) -> usize {
+        let mut count = 0;
+        let opp = self.to_move.opponent();
+
+        for i in 0..16 {
+            if let Some(piece) = self.pieces[i] {
+                if piece.owner != self.to_move {
+                    continue;
+                }
+
+                let sq = piece.sq as usize;
+                let x = sq % 10;
+                let y = sq / 10;
+                let h = self.heights[sq] as i32;
+
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                        let nsq = (ny * 10 + nx) as usize;
+                        let occ = self.grid[nsq];
+                        if occ != 255 {
+                            let target_piece = self.pieces[occ as usize].unwrap();
+                            if target_piece.owner == opp {
+                                let att = self.attack_value(piece.kind, h, self.heights[nsq] as i32);
+                                let def = self.attack_value(
+                                    target_piece.kind,
+                                    self.heights[nsq] as i32,
+                                    h,
+                                );
+                                if att >= def && count < 64 {
+                                    buffer[count] = SimMove {
+                                        piece_idx: i as u8,
+                                        from: sq as u8,
+                                        to: nsq as u8,
+                                        kind: MoveKind::Attack,
+                                        cost: 2,
+                                        captured_idx: occ,
+                                    };
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Explorer diagonal captures
+                if piece.kind == PieceKind::Explorer {
+                    for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && nx < 10 && ny >= 0 && ny < 10 {
+                            let nsq = (ny * 10 + nx) as usize;
+                            let occ = self.grid[nsq];
+                            if occ != 255 {
+                                let target_piece = self.pieces[occ as usize].unwrap();
+                                if target_piece.owner == opp {
+                                    let att = self.attack_value(piece.kind, h, self.heights[nsq] as i32);
+                                    let def = self.attack_value(
+                                        target_piece.kind,
+                                        self.heights[nsq] as i32,
+                                        h,
+                                    );
+                                    if att >= def && count < 64 {
+                                        buffer[count] = SimMove {
+                                            piece_idx: i as u8,
+                                            from: sq as u8,
+                                            to: nsq as u8,
+                                            kind: MoveKind::Attack,
+                                            cost: 2,
+                                            captured_idx: occ,
+                                        };
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        for (i, m) in turn.moves.iter().enumerate() {
-            if m.kind == MoveKind::Exit {
-                return i;
+        count
+    }
+}
+
+fn order_moves(moves: &mut [SimMove; 64], count: usize, board: &BoardState) {
+    // Simple move ordering: prioritize Sentinel exits and captures
+    for i in 0..count {
+        for j in (i + 1)..count {
+            let mi = moves[i];
+            let mj = moves[j];
+
+            let score_i = move_score(mi, board);
+            let score_j = move_score(mj, board);
+
+            if score_j > score_i {
+                moves.swap(i, j);
             }
         }
+    }
+}
+
+fn move_score(m: SimMove, board: &BoardState) -> i32 {
+    if m.kind == MoveKind::Exit {
+        if board.pieces[m.piece_idx as usize].unwrap().kind == PieceKind::Sentinel {
+            return 10_000_000; // Highest priority
+        }
+        return 1_000_000;
+    }
+
+    if m.kind == MoveKind::Attack {
+        let captured = board.pieces[m.captured_idx as usize].unwrap();
+        if captured.kind == PieceKind::Sentinel {
+            return 5_000_000;
+        }
+        return match captured.kind {
+            PieceKind::Vanguard => 2_000_000,
+            PieceKind::Explorer => 1_000_000,
+            _ => 500_000,
+        };
+    }
+
+    0
+}
+
+fn negamax(
+    board: &mut BoardState,
+    depth: u32,
+    mut alpha: i32,
+    beta: i32,
+    aborted: &mut bool,
+) -> i32 {
+    if *aborted || fuel_left() < SAFETY_FUEL {
+        *aborted = true;
         return 0;
     }
 
-    let board = BoardState::from_turn(turn);
-    let mut root_moves = [SimMove::default(); 64];
-    let root_count = board.generate_moves(&mut root_moves);
-
-    if root_count == 0 {
-        return 0;
+    // Check for terminal states
+    if board.sentinel_exited[Player::Red as usize] {
+        return if board.to_move == Player::Red { -SENTINEL_EXIT_WIN } else { SENTINEL_EXIT_WIN };
+    }
+    if board.sentinel_exited[Player::Blue as usize] {
+        return if board.to_move == Player::Blue { -SENTINEL_EXIT_WIN } else { SENTINEL_EXIT_WIN };
     }
 
-    // MCTS avec gestion d'arbre par indices
-    let mut root = MCTSNode::new();
-    root.untried_moves = (0..root_count).collect();
-
-    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
-    let mut iterations = 0;
-
-    while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
-        let mut nodes = vec![root.clone()];
-        let mut board_states = vec![board.clone()];
-        let mut path = Vec::new();
-        let mut current_node_idx = 0;
-
-        // Sélection
-        loop {
-            let node = nodes[current_node_idx].clone();
-            if node.untried_moves.is_empty() && node.children.is_empty() {
-                break;
-            }
-            if !node.untried_moves.is_empty() {
-                break;
-            }
-
-            let best_idx = node.children.iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    let uct_a = a.uct_value(1.414, node.visits);
-                    let uct_b = b.uct_value(1.414, node.visits);
-                    uct_a.partial_cmp(&uct_b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-
-            path.push(current_node_idx);
-            nodes.push(node.children[best_idx].clone());
-            current_node_idx = nodes.len() - 1;
-
-            let m = root_moves[nodes[current_node_idx].move_index];
-            board_states.last_mut().unwrap().apply(m);
-        }
-
-        // Expansion
-        let node = nodes[current_node_idx].clone();
-        if !node.untried_moves.is_empty() {
-            let move_idx = node.untried_moves[rng.gen_range(0..node.untried_moves.len())];
-            let m = root_moves[move_idx];
-
-            let mut child = MCTSNode::new();
-            child.move_index = move_idx;
-            nodes[current_node_idx].untried_moves.remove(
-                nodes[current_node_idx].untried_moves.iter().position(|&x| x == move_idx).unwrap()
-            );
-            nodes[current_node_idx].children.push(child.clone());
-            nodes.push(child);
-            current_node_idx = nodes.len() - 1;
-            path.push(current_node_idx);
-
-            board_states.last_mut().unwrap().apply(m);
-        }
-
-        // Simulation
-        let mut sim_board = board_states.last().unwrap().clone();
-        let result = simulate(&mut sim_board, &mut rng);
-
-        // Backpropagation
-        for &node_idx in &path {
-            nodes[node_idx].visits += 1;
-            nodes[node_idx].total_value += result;
-        }
-
-        root = nodes[0].clone();
-        iterations += 1;
+    if depth == 0 {
+        return quiescence(board, alpha, beta, aborted);
     }
 
-    // Retourne le move avec le plus de visites
-    if !root.children.is_empty() {
-        let best_idx = root.best_child();
-        root.children[best_idx].move_index
+    let mut moves = [SimMove::default(); 64];
+    let move_count = board.generate_moves(&mut moves);
+    order_moves(&mut moves, move_count, board);
+
+    let mut best_score = -INF;
+
+    for i in 0..move_count {
+        let m = moves[i];
+        let (prev_sq, captured, exited) = board.apply(m);
+        let score = -negamax(board, depth - 1, -beta, -alpha, aborted);
+        board.unmake(m, prev_sq, captured, exited);
+
+        if *aborted {
+            return 0;
+        }
+
+        if score >= beta {
+            return beta;
+        }
+
+        if score > best_score {
+            best_score = score;
+            if score > alpha {
+                alpha = score;
+            }
+        }
+    }
+
+    if best_score == -INF {
+        // No legal moves - should not happen in Traversal
+        return -SENTINEL_EXIT_WIN;
+    }
+
+    best_score
+}
+
+fn choose(turn: Turn) -> Move {
+    let mut board = BoardState::from_turn(&turn);
+    let mut moves = [SimMove::default(); 64];
+    let move_count = board.generate_moves(&mut moves);
+    order_moves(&mut moves, move_count, &board);
+
+    if move_count == 0 {
+        return Move::pass();
+    }
+
+    let mut best_move_idx = 0;
+    let mut best_score = -INF;
+    let mut aborted = false;
+
+    // Iterative deepening
+    for depth in 1..=MAX_DEPTH {
+        if fuel_left() < SAFETY_FUEL {
+            break;
+        }
+
+        let mut depth_best = best_move_idx;
+        let mut alpha = -INF;
+        let beta = INF;
+
+        for i in 0..move_count {
+            if fuel_left() < SAFETY_FUEL {
+                aborted = true;
+                break;
+            }
+
+            let m = moves[i];
+            let (prev_sq, captured, exited) = board.apply(m);
+            let score = -negamax(&mut board, depth - 1, -beta, -alpha, &mut aborted);
+            board.unmake(m, prev_sq, captured, exited);
+
+            if aborted {
+                break;
+            }
+
+            if score > alpha {
+                alpha = score;
+                depth_best = i;
+            }
+        }
+
+        if !aborted {
+            best_move_idx = depth_best;
+            best_score = alpha;
+        } else {
+            break;
+        }
+    }
+
+    // Convert SimMove to Move
+    let best_sim_move = moves[best_move_idx];
+    let piece = board.pieces[best_sim_move.piece_idx as usize].unwrap();
+
+    if best_sim_move.kind == MoveKind::Exit {
+        Move::exit(piece.idx)
+    } else if best_sim_move.kind == MoveKind::Attack {
+        Move::attack(piece.idx, best_sim_move.to)
     } else {
-        for (i, m) in root_moves.iter().enumerate() {
-            if m.kind == MoveKind::Exit {
-                return i;
-            }
-        }
-        0
+        Move::move_to(piece.idx, best_sim_move.to)
     }
 }
 
