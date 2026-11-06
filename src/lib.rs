@@ -1,25 +1,17 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
-use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 const SAFETY_FUEL: u64 = 50_000_000;
 const MAX_ITERATIONS: usize = 1500;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SimMoveKind {
-    Move,
-    Attack,
-    Exit,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SimMove {
     pub piece_idx: u8,
     pub from: u8,
     pub to: u8,
-    pub kind: SimMoveKind,
+    pub kind: MoveKind,
     pub cost: u8,
     pub captured_idx: u8,
 }
@@ -30,7 +22,7 @@ impl Default for SimMove {
             piece_idx: 0,
             from: 0,
             to: 0,
-            kind: SimMoveKind::Move,
+            kind: MoveKind::Move,
             cost: 0,
             captured_idx: 255,
         }
@@ -92,7 +84,7 @@ impl BoardState {
         let mut exited = false;
 
         match m.kind {
-            SimMoveKind::Exit => {
+            MoveKind::Exit => {
                 self.grid[m.from as usize] = 255;
                 self.pieces_sq[p] = 255;
                 self.pieces_alive[p] = false;
@@ -101,7 +93,7 @@ impl BoardState {
                     self.sentinel_exited[self.to_move as usize] = true;
                 }
             }
-            SimMoveKind::Attack => {
+            MoveKind::Attack => {
                 let target = m.to as usize;
                 captured = self.grid[target];
                 if captured != 255 {
@@ -112,7 +104,7 @@ impl BoardState {
                 self.grid[target] = m.piece_idx;
                 self.pieces_sq[p] = m.to;
             }
-            SimMoveKind::Move => {
+            MoveKind::Move => {
                 self.grid[m.from as usize] = 255;
                 self.grid[m.to as usize] = m.piece_idx;
                 self.pieces_sq[p] = m.to;
@@ -169,7 +161,7 @@ impl BoardState {
                     piece_idx: i as u8,
                     from: sq as u8,
                     to: 255,
-                    kind: SimMoveKind::Exit,
+                    kind: MoveKind::Exit,
                     cost: 1,
                     captured_idx: 255,
                 };
@@ -192,7 +184,7 @@ impl BoardState {
                                 piece_idx: i as u8,
                                 from: sq as u8,
                                 to: nsq as u8,
-                                kind: SimMoveKind::Move,
+                                kind: MoveKind::Move,
                                 cost,
                                 captured_idx: 255,
                             };
@@ -207,7 +199,7 @@ impl BoardState {
                                 piece_idx: i as u8,
                                 from: sq as u8,
                                 to: nsq as u8,
-                                kind: SimMoveKind::Attack,
+                                kind: MoveKind::Attack,
                                 cost: 2,
                                 captured_idx: occ,
                             };
@@ -229,7 +221,7 @@ impl BoardState {
                                 piece_idx: i as u8,
                                 from: sq as u8,
                                 to: nsq as u8,
-                                kind: SimMoveKind::Move,
+                                kind: MoveKind::Move,
                                 cost: 1,
                                 captured_idx: 255,
                             };
@@ -248,7 +240,7 @@ impl BoardState {
                                 piece_idx: i as u8,
                                 from: sq as u8,
                                 to: nsq as u8,
-                                kind: SimMoveKind::Move,
+                                kind: MoveKind::Move,
                                 cost: 1,
                                 captured_idx: 255,
                             };
@@ -363,16 +355,16 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
             return 0.0;
         }
 
-        // Sélectionne un move avec priorité Sentinel
+        // Priorité absolue aux Sentinels
         let mut scores = vec![0.0; count];
         for i in 0..count {
             let m = &moves[i];
-            if m.kind == SimMoveKind::Exit {
+            if m.kind == MoveKind::Exit {
                 scores[i] = 10_000.0;
                 if board.pieces_kind[m.piece_idx as usize] == 2 {
-                    scores[i] += 100_000.0;
+                    scores[i] += 100_000.0; // Sentinel = victoire
                 }
-            } else if m.kind == SimMoveKind::Attack {
+            } else if m.kind == MoveKind::Attack {
                 scores[i] = 1000.0;
                 if m.captured_idx != 255 && board.pieces_kind[m.captured_idx as usize] == 2 {
                     scores[i] += 50_000.0;
@@ -382,12 +374,12 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
                 let target_y = if board.to_move == 1 { 9 } else { 0 };
                 scores[i] = (target_y - y).abs() as f32 * 100.0;
                 if board.blocks_sentinel(m.to) {
-                    scores[i] += 50_000.0;
+                    scores[i] += 50_000.0; // Bloquer Sentinel adverse
                 }
             }
         }
 
-        // Sélectionne un move pondéré par les scores
+        // Sélection pondérée
         let total: f32 = scores.iter().sum();
         if total > 0.0 {
             let r = rng.gen_range(0.0..total);
@@ -411,7 +403,7 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // Si fuel très bas, retourne un move rapide
+    // Mode rapide si fuel bas
     if fuel_left() < SAFETY_FUEL {
         let state = &turn.state;
         let pieces = state.pieces();
@@ -427,11 +419,6 @@ fn choose(turn: &Turn) -> usize {
                 return i;
             }
         }
-        for (i, m) in turn.moves.iter().enumerate() {
-            if m.kind == MoveKind::Attack {
-                return i;
-            }
-        }
         return 0;
     }
 
@@ -443,20 +430,22 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // Initialise MCTS
+    // MCTS avec gestion d'arbre simplifiée
     let mut root = MCTSNode::new();
     root.untried_moves = (0..root_count).collect();
 
-    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
+    let mut rng = ChaCha8Rng::from_seed(turn.seed.to_le_bytes());
     let mut iterations = 0;
 
     while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
-        let mut node = &mut root;
+        let mut current_node = 0; // Index du nœud courant
+        let mut nodes = vec![root.clone()];
+        let mut board_states = vec![board.clone()];
         let mut path = Vec::new();
-        let mut board_stack = vec![board.clone()];
 
         // Sélection
         loop {
+            let node = &mut nodes[current_node];
             if node.untried_moves.is_empty() && node.children.is_empty() {
                 break;
             }
@@ -464,6 +453,7 @@ fn choose(turn: &Turn) -> usize {
                 break;
             }
 
+            // Trouve le meilleur enfant
             let best_idx = node.children.iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| {
@@ -474,45 +464,45 @@ fn choose(turn: &Turn) -> usize {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
-            path.push(node);
-            node = &mut node.children[best_idx];
+            path.push(current_node);
+            current_node = best_idx + nodes.len(); // Les enfants sont stockés après
+            nodes.push(node.children[best_idx].clone());
 
             // Applique le move
-            let m = root_moves[node.move_index];
-            board_stack.last_mut().unwrap().apply(m);
-            board_stack.push(board_stack.last().unwrap().clone());
+            let m = root_moves[nodes[current_node].move_index];
+            board_states.last_mut().unwrap().apply(m);
         }
 
         // Expansion
+        let node = &mut nodes[current_node];
         if !node.untried_moves.is_empty() {
             let move_idx = node.untried_moves.remove(rng.gen_range(0..node.untried_moves.len()));
             let m = root_moves[move_idx];
 
             let mut child = MCTSNode::new();
             child.move_index = move_idx;
-            node.children.push(child);
+            node.children.push(child.clone());
+            nodes.push(child);
 
-            node = &mut node.children.last_mut().unwrap();
-            path.push(node);
+            current_node = nodes.len() - 1;
+            path.push(current_node);
 
             // Applique le move
-            board_stack.last_mut().unwrap().apply(m);
-            board_stack.push(board_stack.last().unwrap().clone());
+            board_states.last_mut().unwrap().apply(m);
         }
 
         // Simulation
-        let mut sim_board = board_stack.last().unwrap().clone();
+        let mut sim_board = board_states.last().unwrap().clone();
         let result = simulate(&mut sim_board, &mut rng);
 
         // Backpropagation
-        for node in &mut path {
-            node.visits += 1;
-            node.total_value += result;
+        for &node_idx in &path {
+            nodes[node_idx].visits += 1;
+            nodes[node_idx].total_value += result;
         }
 
-        // Restaure l'état
-        board = board_stack[0].clone();
-
+        // On ne garde que la racine pour la prochaine itération
+        root = nodes[0].clone();
         iterations += 1;
     }
 
@@ -521,6 +511,12 @@ fn choose(turn: &Turn) -> usize {
         let best_idx = root.best_child();
         root.children[best_idx].move_index
     } else {
+        // Si pas d'enfants, retourne le premier move Exit ou Attack
+        for (i, m) in root_moves.iter().enumerate() {
+            if m.kind == MoveKind::Exit {
+                return i;
+            }
+        }
         0
     }
 }
