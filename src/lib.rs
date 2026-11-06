@@ -1,5 +1,6 @@
 use traversal_bot::core::MoveKind;
 use traversal_bot::{bot, fuel_left, Turn};
+use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
@@ -276,7 +277,9 @@ impl BoardState {
 
         (false, 0.0)
     }
+}
 
+impl Clone for BoardState {
     fn clone(&self) -> Self {
         *self
     }
@@ -314,16 +317,13 @@ impl MCTSNode {
     fn best_child(&self) -> usize {
         self.children.iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.visits.cmp(&b.visits)
-            })
+            .max_by(|(_, a), (_, b)| a.visits.cmp(&b.visits))
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
 }
 
 fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
-    let mut current_side = board.to_move;
     let mut ply = 0;
 
     loop {
@@ -377,14 +377,12 @@ fn simulate(board: &mut BoardState, rng: &mut ChaCha8Rng) -> f32 {
                 sum += s;
                 if sum >= r {
                     board.apply(moves[i]);
-                    current_side = 3 - current_side;
                     break;
                 }
             }
         } else {
             let i = rng.gen_range(0..count);
             board.apply(moves[i]);
-            current_side = 3 - current_side;
         }
     }
 }
@@ -429,7 +427,7 @@ fn choose(turn: &Turn) -> usize {
         let pieces = state.pieces();
         for (i, m) in turn.moves.iter().enumerate() {
             if m.kind == MoveKind::Exit {
-                if m.piece as usize < pieces.len() && pieces[m.piece as usize].kind as u8 == 2 {
+                if (m.piece as usize) < pieces.len() && pieces[m.piece as usize].kind as u8 == 2 {
                     return i; // Sentinel Exit = priorité absolue
                 }
             }
@@ -459,14 +457,13 @@ fn choose(turn: &Turn) -> usize {
     let mut root = MCTSNode::new();
     root.untried_moves = (0..root_count).collect();
 
-    let mut rng = ChaCha8Rng::seed_from_u64(turn.seed);
+    let mut rng = ChaCha8Rng::from_seed(turn.seed.into());
     let mut iterations = 0;
 
     while fuel_left() > SAFETY_FUEL && iterations < MAX_ITERATIONS {
         let mut node = &mut root;
         let mut path = Vec::new();
-        let mut board_stack = Vec::new();
-        board_stack.push(board.clone());
+        let mut board_stack = vec![board.clone()];
 
         // Sélection
         loop {
@@ -492,7 +489,7 @@ fn choose(turn: &Turn) -> usize {
 
             // Applique le move
             let m = root_moves[node.move_index];
-            let (prev_sq, captured, exited) = board_stack.last_mut().unwrap().apply(m);
+            board_stack.last_mut().unwrap().apply(m);
             board_stack.push(board_stack.last().unwrap().clone());
         }
 
@@ -509,7 +506,7 @@ fn choose(turn: &Turn) -> usize {
             path.push(node);
 
             // Applique le move
-            let (prev_sq, captured, exited) = board_stack.last_mut().unwrap().apply(m);
+            board_stack.last_mut().unwrap().apply(m);
             board_stack.push(board_stack.last().unwrap().clone());
         }
 
