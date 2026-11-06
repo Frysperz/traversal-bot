@@ -118,31 +118,6 @@ impl BoardState {
         (prev_sq, captured, exited)
     }
 
-    fn unmake(&mut self, m: SimMove, prev_sq: u8, captured: u8, exited: bool) {
-        self.to_move = if self.to_move == 1 { 2 } else { 1 };
-        let p = m.piece_idx as usize;
-
-        if exited {
-            self.pieces_alive[p] = true;
-            self.pieces_sq[p] = prev_sq;
-            self.grid[prev_sq as usize] = m.piece_idx;
-            if self.pieces_kind[p] == 2 {
-                self.sentinel_exited[self.to_move as usize] = false;
-            }
-        } else {
-            self.grid[m.to as usize] = 255;
-            self.grid[prev_sq as usize] = m.piece_idx;
-            self.pieces_sq[p] = prev_sq;
-
-            if captured != 255 {
-                let cap = captured as usize;
-                self.pieces_alive[cap] = true;
-                self.pieces_sq[cap] = m.to;
-                self.grid[m.to as usize] = captured;
-            }
-        }
-    }
-
     fn generate_moves(&self, buffer: &mut [SimMove; 64]) -> usize {
         let mut count = 0;
         let opp = if self.to_move == 1 { 2 } else { 1 };
@@ -425,7 +400,7 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    let mut board = BoardState::from_turn(turn);
+    let board = BoardState::from_turn(turn);
     let mut root_moves = [SimMove::default(); 64];
     let root_count = board.generate_moves(&mut root_moves);
 
@@ -433,7 +408,7 @@ fn choose(turn: &Turn) -> usize {
         return 0;
     }
 
-    // MCTS simplifié
+    // MCTS avec gestion d'arbre par indices
     let mut root = MCTSNode::new();
     root.untried_moves = (0..root_count).collect();
 
@@ -448,7 +423,7 @@ fn choose(turn: &Turn) -> usize {
 
         // Sélection
         loop {
-            let node = &mut nodes[current_node_idx];
+            let node = nodes[current_node_idx].clone();
             if node.untried_moves.is_empty() && node.children.is_empty() {
                 break;
             }
@@ -475,14 +450,17 @@ fn choose(turn: &Turn) -> usize {
         }
 
         // Expansion
-        let node = &mut nodes[current_node_idx];
+        let node = nodes[current_node_idx].clone();
         if !node.untried_moves.is_empty() {
-            let move_idx = node.untried_moves.remove(rng.gen_range(0..node.untried_moves.len()));
+            let move_idx = node.untried_moves[rng.gen_range(0..node.untried_moves.len())];
             let m = root_moves[move_idx];
 
             let mut child = MCTSNode::new();
             child.move_index = move_idx;
-            node.children.push(child.clone());
+            nodes[current_node_idx].untried_moves.remove(
+                nodes[current_node_idx].untried_moves.iter().position(|&x| x == move_idx).unwrap()
+            );
+            nodes[current_node_idx].children.push(child.clone());
             nodes.push(child);
             current_node_idx = nodes.len() - 1;
             path.push(current_node_idx);
@@ -500,7 +478,6 @@ fn choose(turn: &Turn) -> usize {
             nodes[node_idx].total_value += result;
         }
 
-        // On garde la racine mise à jour
         root = nodes[0].clone();
         iterations += 1;
     }
